@@ -30,16 +30,39 @@ DEFAULT_PY_VERSION=${DEFAULT_PY_VERSION:-3.13}
 DEFAULT_JAVA_VERSION=${DEFAULT_JAVA_VERSION:-21}
 DEFAULT_NODE_VERSION=${DEFAULT_NODE_VERSION:-22}
 DEFAULT_GO_VERSION=${DEFAULT_GO_VERSION:-1.25}
+PYTHON_SHIMS_DIR=${PYTHON_SHIMS_DIR:-/opt/opensandbox/python-shims}
 
 append_env_if_needed() {
 	local key=$1
 	local value=$2
 	if [ -z "${EXECD_ENVS:-}" ]; then
 		return
-	}
+	fi
 	# Best-effort: ensure parent dir exists, ignore errors.
 	mkdir -p "$(dirname "$EXECD_ENVS")" 2>/dev/null || true
 	printf '%s=%s\n' "$key" "$value" >>"$EXECD_ENVS" 2>/dev/null || true
+}
+
+setup_python_command_shims() {
+	local target_dir=$1
+	local shim_dir=$PYTHON_SHIMS_DIR
+
+	mkdir -p "$shim_dir"
+
+	cat >"$shim_dir/python" <<SH
+#!/bin/sh
+exec "$target_dir/bin/python3" "\$@"
+SH
+
+	cat >"$shim_dir/pip" <<SH
+#!/bin/sh
+exec "$target_dir/bin/python3" -m pip "\$@"
+SH
+
+	chmod +x "$shim_dir/python" "$shim_dir/pip"
+
+	export PATH="$shim_dir:$PATH"
+	append_env_if_needed PATH "$PATH"
 }
 
 function switch_python() {
@@ -56,6 +79,7 @@ function switch_python() {
 	if [ -d "$target_dir" ]; then
 		export PATH="$target_dir/bin:$PATH"
 		append_env_if_needed PATH "$PATH"
+		setup_python_command_shims "$target_dir"
 		echo "Switched to Python $(python3 --version)"
 	else
 		echo "Python version $version not found."
