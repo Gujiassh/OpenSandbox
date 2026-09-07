@@ -349,7 +349,9 @@ async def test_prepare_runtime_failure_triggers_cleanup(
     mock_client.containers.get.return_value = mock_container
     mock_docker.from_env.return_value = mock_client
 
-    service = DockerSandboxService(config=_app_config())
+    config = _app_config()
+    config.docker.network_mode = "bridge"
+    service = DockerSandboxService(config=config)
     request = CreateSandboxRequest(
         image=ImageSpec(uri="python:3.11"),
         timeout=120,
@@ -359,14 +361,26 @@ async def test_prepare_runtime_failure_triggers_cleanup(
         entrypoint=["python"],
     )
 
+    bindings = {
+        "44772": ("0.0.0.0", 40001),
+        "8080": ("0.0.0.0", 40002),
+    }
     with (
         patch.object(service, "_ensure_image_available"),
         patch.object(service, "_prepare_sandbox_runtime", side_effect=runtime_exc),
+        patch(
+            "opensandbox_server.services.docker.docker_service.allocate_port_bindings",
+            return_value=bindings,
+        ),
+        patch(
+            "opensandbox_server.services.docker.docker_service.release_port_bindings"
+        ) as release_port_bindings,
     ):
         with pytest.raises(HTTPException) as exc:
             await service.create_sandbox(request)
 
     mock_container.remove.assert_called_with(force=True)
+    release_port_bindings.assert_called_once_with(bindings)
 
     assert exc.value.status_code == expected_status
 

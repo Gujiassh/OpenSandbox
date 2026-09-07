@@ -12,6 +12,7 @@ This page lists the OpenTelemetry metrics currently implemented in egress.
 |---|---|---|---|
 | `egress.dns.query.duration` | Histogram | `s` | Upstream DNS forward latency (recorded for allowed queries). |
 | `egress.dns.query.failed_total` | Counter | - | Queries the proxy could not resolve, by `reason`. |
+| `egress.dns.reply.failed_total` | Counter | - | Reply writes that failed after a decision, by `stage`. A nonzero count means a query was handled but its answer never reached the client. |
 | `egress.policy.denied_total` | Counter | - | Number of DNS queries denied by policy. |
 | `egress.nftables.rules.count` | Observable Gauge | `{element}` | Approximate policy size after last successful static apply (fleet profile: summed across every installed subject's policy, 0 while deny-first). |
 | `egress.nftables.updates.count` | Counter | - | Number of successful nftables updates (static apply + dynamic IP add). |
@@ -66,15 +67,21 @@ queried name nor the error text is ever attached:
 
 `egress.nftables.updates.failed_total` covers the other silent failure. Its `operation`
 attribute is one of `static_apply`, `dynamic_add`, `remove`, or — in the fleet profile
-(OSEP-0022) — `deny_first`, `dispatch_update`, `reset`; `dynamic_add` is the one to
+(OSEP-0022) — `deny_first`, `reset`; `dynamic_add` is the one to
 alert on, because a failed add means the kernel never learned about IPs the policy allows,
 so the chain drops traffic that should pass — which looks exactly like a policy denial from
 inside the sandbox while `egress.policy.denied_total` stays flat.
 
-The per-sandbox netns layer (fleet profile) counts its updates under the same operations;
-two expected cases are deliberately NOT counted as failures: a sandbox-layer removal whose
-netns is already destroyed (the rules died with it), and the startup recovery sweep of
-netns that never had a table installed.
+`egress.dns.reply.failed_total` covers the last silent failure class: a query that was
+**handled** (decided, maybe forwarded and answered upstream) whose reply write then failed.
+Until the write error was surfaced, such windows were indistinguishable from "query never
+handled" — the fleet-profile case where guest-originated DNS is answered in the proxy but
+the reply never reaches the sandbox (issue #1704). Its `stage` attribute is one of
+`malformed`, `unknown_source`, `deny`, `upstream_error`, `answer`, and every failure also
+emits a `[dns] reply write failed (stage=… remote=… question=…)` warning with the remote
+address and query name, so the counter pinpoints the condition and the log line the flow.
+Alert on any nonzero value: like `dynamic_add`, an `answer`-stage failure means traffic the
+policy allows is not reaching the client.
 
 A `static_apply` failure happens during startup, where the sidecar logs and exits. Metrics
 leave through a periodic reader and `os.Exit` skips the deferred shutdown, so that path

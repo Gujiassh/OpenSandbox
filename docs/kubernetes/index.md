@@ -399,6 +399,31 @@ spec:
   poolRef: example-pool
 ```
 
+::: warning `Ready` does not guarantee SDK exec support
+The example above allocates warm `nginx` pods and is useful when the container's
+own service is the workload. With the default server setting
+`runtime.execd_run_as_init = false`, a lifecycle API request containing only
+`extensions.poolRef` does not create a `taskTemplate`. In that case, `Running` /
+`Ready` means that the pooled Pod passed its Kubernetes readiness checks; it
+does **not** mean that the OpenSandbox exec service is listening on port `44772`.
+
+When `runtime.execd_run_as_init = true`, the server creates a `taskTemplate`
+even for a pool-only request. That Pool must already run task-executor and
+provide executable `/opt/opensandbox/bootstrap.sh` and
+`/opt/opensandbox/execd` files (or set `EXECD` to another installed execd
+binary), just like the custom entrypoint and environment path described below.
+The plain `nginx` Pool in this example does not meet that task-execution
+contract.
+
+For an interactive SDK sandbox, either make the Pool template start execd as
+part of its normal container command, or send a non-default `entrypoint` or a
+non-empty environment in the lifecycle request and configure the Pool with
+task-executor plus executable `/opt/opensandbox/bootstrap.sh` and
+`/opt/opensandbox/execd` files (or an `EXECD` override) as described below. A
+plain service image such as `nginx` cannot serve interactive SDK calls without
+one of those setups.
+:::
+
 ::: info Pool capacity back-pressure
 When a lifecycle request cannot obtain a slot because the selected Pool is at
 `poolMax`, the controller records `PoolAllocationPending=True` with reason
@@ -419,7 +444,7 @@ Pool pods are created before allocation. The lifecycle API therefore rejects `ne
 ::: tip Entrypoint and environment injection
 Pool pods are also created before a lifecycle request supplies its `entrypoint` or environment variables. The server does not rewrite the allocated Pod's `command`, `args`, or `env`; seeing the original Pool template in the Pod YAML is expected. Instead, it writes the request-specific process to `BatchSandbox.spec.taskTemplate`, and the controller sends that task to an in-pod task-executor on port `5758`.
 
-A Pool used through the lifecycle API with a custom entrypoint or environment must therefore run task-executor and provide an executable `/opt/opensandbox/bootstrap.sh`. See the [Code Interpreter Pool example](/examples/code-interpreter#how-pool-entrypoint-injection-works) for a complete template and troubleshooting commands.
+A Pool used through the lifecycle API with a custom entrypoint or environment must therefore run task-executor, provide an executable `/opt/opensandbox/bootstrap.sh`, and install execd at `/opt/opensandbox/execd` or set `EXECD` to another installed execd binary. See the [Code Interpreter Pool example](/examples/code-interpreter#how-pool-entrypoint-injection-works) for a complete template and troubleshooting commands.
 :::
 
 ::: tip Shared storage in Pool mode
@@ -503,12 +528,12 @@ For a BatchSandbox with multiple replicas, `Succeed` also does not mean that eve
 
 | `status.phase` | Meaning |
 |---|---|
-| `Pending` | The controller has not observed a Running and Ready sandbox Pod yet. |
+| `Pending` | The controller has not observed a Running and Ready sandbox Pod yet. Scheduling waits and retryable image-pull states remain Pending. |
 | `Succeed` | At least one sandbox Pod is Running and Ready; the sandbox is available. |
 | `Pausing` | A pause operation is in progress. |
 | `Paused` | The sandbox is paused and its runtime resources have been released. |
 | `Resuming` | The controller is restoring runtime resources after a pause. |
-| `Failed` | The controller detected a sandbox runtime failure. Inspect conditions and Pod events for details. |
+| `Failed` | The controller detected a terminal sandbox runtime failure. A Pod in Kubernetes phase `Failed` is terminal; inspect conditions and Pod events for details. |
 
 The controller records active conditions with `status: "True"`:
 
@@ -517,7 +542,9 @@ The controller records active conditions with `status: "True"`:
 | `Ready` | The phase is `Succeed`; reason `PodsReady` means the sandbox is running. |
 | `Progressing` | The sandbox is being created, paused, or resumed. |
 | `Paused` | The sandbox is fully paused. |
-| `PauseFailed`, `ResumeFailed`, `PodFailed` | The corresponding operation or runtime failed; inspect `reason` and `message`. |
+| `PauseFailed`, `ResumeFailed`, `PodFailed` | The corresponding operation or runtime failed; inspect `reason` and `message`. A terminal init-container or container exit is summarized on `PodFailed`. |
+
+`status.taskFailed` remains the number of failed optional tasks. Pod or init-container failures are reported through `status.phase` and `PodFailed`; they do not overwrite task counters. During synchronous sandbox creation, the Server converts a terminal `Failed` phase into `KUBERNETES::POD_FAILED` immediately instead of waiting for the Pod readiness timeout.
 
 Treat a condition as satisfied only when the matching entry exists with `status: "True"`. Check `status.observedGeneration` against `metadata.generation` before acting on status after a spec update.
 
