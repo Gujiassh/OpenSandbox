@@ -189,6 +189,22 @@ See [Credential Vault](/guides/credential-vault) for full API usage, binding rul
 
 Egress can export **OTLP metrics**; application logs use the **native zap** logger (JSON to stdout by default, configurable via `OPENSANDBOX_LOG_OUTPUT` / `OPENSANDBOX_EGRESS_LOG_LEVEL`). The credential proxy's log lines from mitmdump are piped into the same zap sink at warn level, so they land in the egress log file when `OPENSANDBOX_LOG_OUTPUT` points at one; mitmproxy's own flow logs are not forwarded. OTLP log export is not used.
 
+#### Enabling export from the server
+
+When the server config sets `[egress].otlp_endpoint`, the lifecycle server injects it into every egress sidecar as `OTEL_EXPORTER_OTLP_ENDPOINT` (Docker and Kubernetes alike):
+
+```toml
+[egress]
+otlp_endpoint = "http://otel-collector.observability.svc.cluster.local:4318"
+```
+
+- The endpoint must be an `http://` or `https://` URL with a collector host — the telemetry client only speaks OTLP over HTTP/protobuf, so a gRPC endpoint (port 4317) won't work.
+- Use a **fully qualified service name or an IP**, per the auto-allow note below: partial service names get search-domain-expanded to FQDNs the auto-generated allow rule does not match.
+- The collector address is infrastructure config: it is read only from the server config file and cannot be set per request. When unset, sidecar metrics are not exported.
+- The sidecar exports **delta** temporality; a collector feeding Prometheus/GMP needs the `deltatocumulative` processor.
+
+Full key reference: [server configuration.md](https://github.com/opensandbox-group/OpenSandbox/blob/main/server/configuration.md).
+
 #### DNS latency buckets
 
 `egress.dns.query.duration` is recorded in **seconds** and declares its bucket boundaries

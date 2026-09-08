@@ -286,6 +286,23 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: |
+            Namespace ResourceQuota exhausted — the sandbox was not admitted.
+
+            The returned `ErrorResponse.code` is `KUBERNETES::QUOTA_EXCEEDED` and
+            `message` carries the Kubernetes admission rejection details.
+
+            This fail-fast behavior applies when the `agent-sandbox` workload
+            provider is used. With the default `batchsandbox` provider, quota
+            exhaustion currently waits for the sandbox creation timeout.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestId'
         '409':
           $ref: '#/components/responses/Conflict'
         '429':

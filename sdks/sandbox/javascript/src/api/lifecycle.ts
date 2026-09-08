@@ -154,6 +154,21 @@ export interface paths {
                 };
                 400: components["responses"]["BadRequest"];
                 401: components["responses"]["Unauthorized"];
+                /**
+                 * @description Namespace ResourceQuota exhausted — the sandbox was not admitted.
+                 *
+                 *     The returned `ErrorResponse.code` is `KUBERNETES::QUOTA_EXCEEDED` and
+                 *     `message` carries the Kubernetes admission rejection details.
+                 */
+                403: {
+                    headers: {
+                        "X-Request-ID": components["headers"]["XRequestId"];
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorResponse"];
+                    };
+                };
                 409: components["responses"]["Conflict"];
                 /** @description Pool capacity remained unavailable before the acquisition timeout */
                 429: {
