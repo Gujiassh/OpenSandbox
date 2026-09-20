@@ -1,0 +1,145 @@
+name: Diagnostic Execd Init Accounting
+
+on:
+  push:
+    branches: [diagnostics/execd-init-accounting-20260921]
+    paths:
+      - .github/workflows/diagnostic-execd-init.yml
+      - scripts/diagnostics/**
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - label: current-200ms-original
+            sha: 07e95cccd294b92f81bb715d22af6da2b619227d
+          - label: zero-tail-original
+            sha: 5ab659f7ee8f9a77c4e6658fc5c748067b8edd42
+          - label: zero-tail-corrected
+            sha: 36a070ba4dea9fd94697d8e40f3976d77cb682d8
+    env:
+      OPENSANDBOX_SANDBOX_DEFAULT_IMAGE: opensandbox/code-interpreter@sha256:64cd01f03f54ba347d1a1310dcbc18ac5cb17d01714e23b4ea4b840fbb0d6623
+      RADAR_DIAGNOSTICS_DIR: ${{ github.workspace }}/evidence
+      RADAR_HARNESS_DIR: ${{ github.workspace }}/harness
+      RADAR_SOURCE_SHA: ${{ matrix.sha }}
+    steps:
+      - name: Checkout diagnostic harness
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: harness
+          persist-credentials: false
+      - name: Checkout exact source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: Gujiassh/OpenSandbox
+          ref: ${{ matrix.sha }}
+          path: source
+          persist-credentials: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          enable-cache: false
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.25.9'
+          cache: false
+      - name: Record exact source and native environment
+        id: identity
+        working-directory: source
+        run: |
+          set -euo pipefail
+          mkdir -p "$RADAR_DIAGNOSTICS_DIR"
+          test "$(git rev-parse HEAD)" = "$RADAR_SOURCE_SHA"
+          git diff --exit-code
+          bash -n "$RADAR_HARNESS_DIR/scripts/diagnostics/run_execd_causal.sh"
+          {
+            printf 'source='; git rev-parse HEAD
+            printf 'tree='; git rev-parse 'HEAD^{tree}'
+            printf 'harness='; git -C ../harness rev-parse HEAD
+            git ls-tree HEAD components/execd/pkg/web/controller/command.go tests/python/tests/test_execd_init_e2e.py
+            uname -a
+            docker version
+            go version
+            uv --version
+            df -h
+          } > "$RADAR_DIAGNOSTICS_DIR/environment.txt"
+          sha256sum server/uv.lock tests/python/uv.lock sdks/sandbox/python/uv.lock \
+            sdks/code-interpreter/python/uv.lock components/execd/go.mod components/execd/go.sum \
+            > "$RADAR_DIAGNOSTICS_DIR/dependency-inputs.sha256"
+          docker pull "$OPENSANDBOX_SANDBOX_DEFAULT_IMAGE"
+          docker image inspect "$OPENSANDBOX_SANDBOX_DEFAULT_IMAGE" --format '{{.Id}}' \
+            > "$RADAR_DIAGNOSTICS_DIR/expected-image-id.txt"
+      - name: Run real focused Go packages
+        id: go-tests
+        working-directory: source/components/execd
+        run: |
+          set -uo pipefail
+          set +e
+          go test -count=1 -timeout=8m -v ./pkg/web/controller ./pkg/runtime ./pkg/flag \
+            2>&1 | tee "$RADAR_DIAGNOSTICS_DIR/go-tests.log"
+          codes=("${PIPESTATUS[@]}")
+          printf '%s\n' "${codes[0]}" > "$RADAR_DIAGNOSTICS_DIR/go-exit-code.txt"
+          test "${codes[1]}" -eq 0 && exit "${codes[0]}"
+          exit 1
+      - name: Build egress and configure native Docker bridge
+        id: configure
+        if: ${{ !cancelled() && steps.identity.outcome == 'success' }}
+        working-directory: source
+        run: |
+          set -euo pipefail
+          docker build -t opensandbox/egress:local -f components/egress/Dockerfile .
+          cat > ~/.sandbox.toml <<'TOML'
+          [server]
+          host = "127.0.0.1"
+          port = 8080
+          api_key = ""
+          [log]
+          level = "INFO"
+          [runtime]
+          type = "docker"
+          execd_image = "opensandbox/execd:local"
+          execd_run_as_init = true
+          [egress]
+          image = "opensandbox/egress:local"
+          mode = "dns+nft"
+          [docker]
+          network_mode = "bridge"
+          [storage]
+          allowed_host_paths = ["/tmp/opensandbox-e2e"]
+          [renew_intent]
+          enabled = true
+          min_interval_seconds = 60
+          TOML
+      - name: Run original outcomes, focused repeats and existing stream matrix
+        if: ${{ !cancelled() && steps.configure.outcome == 'success' }}
+        working-directory: source
+        run: bash "$RADAR_HARNESS_DIR/scripts/diagnostics/run_execd_causal.sh"
+      - name: Collect source and lock status even after setup failure
+        if: always()
+        working-directory: source
+        run: |
+          mkdir -p "$RADAR_DIAGNOSTICS_DIR"
+          git status --short > "$RADAR_DIAGNOSTICS_DIR/final-source-status.txt"
+          git diff -- components/execd tests/python/tests scripts/python-execd-init-e2e.sh \
+            > "$RADAR_DIAGNOSTICS_DIR/final-tested-source.diff"
+          docker image ls --digests > "$RADAR_DIAGNOSTICS_DIR/final-docker-images.txt"
+      - name: Upload every variant outcome and process observation
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: execd-accounting-${{ matrix.label }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 5
+      - name: Clean disposable runner containers
+        if: always()
+        run: docker ps -aq --filter label=opensandbox | xargs -r docker rm -f
