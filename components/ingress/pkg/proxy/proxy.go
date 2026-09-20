@@ -26,7 +26,6 @@ import (
 	"time"
 
 	slogger "github.com/alibaba/opensandbox/internal/logger"
-	"github.com/gorilla/websocket"
 
 	"github.com/alibaba/opensandbox/ingress/pkg/renewintent"
 	"github.com/alibaba/opensandbox/ingress/pkg/routescope"
@@ -37,6 +36,16 @@ import (
 
 const httpScheme = "http"
 
+// Mode selects how the target sandbox is discovered from an incoming request.
+type Mode string
+
+const (
+	// ModeHeader resolves the target from the OpenSandbox-Ingress-To header or Host.
+	ModeHeader Mode = "header"
+	// ModeURI resolves the target from leading URI path segments.
+	ModeURI Mode = "uri"
+)
+
 type Proxy struct {
 	sandboxProvider      sandbox.Provider
 	mode                 Mode
@@ -45,24 +54,26 @@ type Proxy struct {
 	secure *signature.Verifier
 	scope  *routescope.Verifier
 
-	httpTransport   http.RoundTripper
-	websocketDialer *websocket.Dialer
+	httpTransport             http.RoundTripper
+	websocketClient           *http.Client
+	websocketMessageSizeLimit int64
 }
 
 func NewProxy(_ context.Context, sandboxProvider sandbox.Provider, mode Mode, renewIntentPublisher renewintent.Publisher, secure *signature.Verifier, scope *routescope.Verifier, opts ...Option) *Proxy {
-	options := proxyOptions{}
+	options := proxyOptions{webSocketMessageSizeLimit: defaultWebSocketMessageSizeLimit}
 	for _, opt := range opts {
 		opt(&options)
 	}
 
 	return &Proxy{
-		sandboxProvider:      sandboxProvider,
-		mode:                 mode,
-		renewIntentPublisher: renewIntentPublisher,
-		secure:               secure,
-		scope:                scope,
-		httpTransport:        newObservedHTTPTransport(options.connectObserver),
-		websocketDialer:      newObservedWebSocketDialer(options.connectObserver),
+		sandboxProvider:           sandboxProvider,
+		mode:                      mode,
+		renewIntentPublisher:      renewIntentPublisher,
+		secure:                    secure,
+		scope:                     scope,
+		httpTransport:             newObservedHTTPTransport(options.connectObserver),
+		websocketClient:           newObservedWebSocketHTTPClient(options.connectObserver),
+		websocketMessageSizeLimit: options.webSocketMessageSizeLimit,
 	}
 }
 
@@ -144,7 +155,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Header.Del(DeprecatedSandboxIngress)
 	r.Header.Del(signature.OpenSandboxSecureAccessCanonical)
 	r.Header.Del(sandbox.FastSandboxCredential)
-	// Host is carried by r.Host, not r.Header. The Phase 1a Fleets provider
+	// Host is carried by r.Host, not r.Header. The Phase 1a Fast Sandbox provider
 	// accepts only the Fastlet route credential in UpstreamHeaders.
 	for name, values := range host.info.UpstreamHeaders {
 		r.Header.Del(name)
@@ -183,7 +194,8 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, target sandbox.End
 		}
 		websocketProxy := NewWebSocketProxy(r.URL, p.upstreamResponseObserver(target)) //nolint:bodyclose // Failed handshake bodies are closed by copyResponse.
 		websocketProxy.errorObserver = p.upstreamErrorObserver(target)
-		websocketProxy.dialer = p.websocketDialer
+		websocketProxy.httpClient = p.websocketClient
+		websocketProxy.messageSizeLimit = p.websocketMessageSizeLimit
 		websocketProxy.ServeHTTP(w, r)
 	} else {
 		if r.URL.Scheme == "" {
@@ -201,7 +213,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, target sandbox.End
 }
 
 func (p *Proxy) upstreamResponseObserver(target sandbox.EndpointTarget) func(*http.Response) {
-	if target.RouteKind != sandbox.RouteKindFleets {
+	if target.RouteKind != sandbox.RouteKindFastSandbox {
 		return nil
 	}
 	invalidator, ok := p.sandboxProvider.(sandbox.EndpointInvalidator)
@@ -229,7 +241,7 @@ func (p *Proxy) upstreamResponseObserver(target sandbox.EndpointTarget) func(*ht
 }
 
 func (p *Proxy) upstreamErrorObserver(target sandbox.EndpointTarget) func(error) {
-	if target.RouteKind != sandbox.RouteKindFleets {
+	if target.RouteKind != sandbox.RouteKindFastSandbox {
 		return nil
 	}
 	invalidator, ok := p.sandboxProvider.(sandbox.EndpointInvalidator)
@@ -241,17 +253,41 @@ func (p *Proxy) upstreamErrorObserver(target sandbox.EndpointTarget) func(error)
 	}
 }
 
+// isWebSocketRequest reports whether r is an HTTP/1.1 WebSocket upgrade
+// (RFC 6455). The Upgrade header must equal "websocket" and any Connection
+// header must carry an "upgrade" token, both matched case-insensitively;
+// some L7 proxies emit "Connection: keep-alive, Upgrade" which the previous
+// strict equality check in this package would have missed.
+//
+// The ingress does not natively accept RFC 8441 HTTP/2 Extended CONNECT
+// WebSocket upgrades — coder/websocket v1.8.15 only supports the HTTP/1.1
+// handshake shape (see accept.go:184-201). The L7 must ensure that the
+// ingress-facing WebSocket request uses the HTTP/1.1 Upgrade handshake;
+// translation and per-WebSocket fallback behavior are product-specific.
+// See "L7 Frontend Configuration for WebSocket" in docs/components/ingress.md.
 func (p *Proxy) isWebSocketRequest(r *http.Request) bool {
 	if r.Method != http.MethodGet {
 		return false
 	}
-	if r.Header.Get("Upgrade") != "websocket" {
+	if !strings.EqualFold(r.Header.Get(HopByHopUpgrade), "websocket") {
 		return false
 	}
-	if r.Header.Get("Connection") != "Upgrade" {
-		return false
+	return connectionHasToken(r, "upgrade")
+}
+
+// connectionHasToken reports whether any Connection header value in r contains
+// the given token, matched case-insensitively after comma splitting. This
+// accepts "Connection: keep-alive, Upgrade" and other token-list forms allowed
+// by RFC 7230 §6.1.
+func connectionHasToken(r *http.Request, token string) bool {
+	for _, v := range r.Header.Values(HopByHopConnection) {
+		for _, tok := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(tok), token) {
+				return true
+			}
+		}
 	}
-	return true
+	return false
 }
 
 func (p *Proxy) resolveRealHost(host *sandboxHost, requestURL *url.URL) (*url.URL, int, error) {
@@ -349,18 +385,18 @@ func (w *statusCapturingResponseWriter) Flush() {
 	}
 }
 
+// getClientIP prefers the first X-Forwarded-For hop, then X-Real-IP, and
+// finally falls back to the remote address.
 func (p *Proxy) getClientIP(r *http.Request) string {
-	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-	if len(r.Header.Get(XForwardedFor)) != 0 {
-		xff := r.Header.Get(XForwardedFor)
-		s := strings.Index(xff, ", ")
-		if s == -1 {
-			s = len(r.Header.Get(XForwardedFor))
+	if xff := r.Header.Get(XForwardedFor); xff != "" {
+		if idx := strings.Index(xff, ", "); idx != -1 {
+			return xff[:idx]
 		}
-		clientIP = xff[:s]
-	} else if len(r.Header.Get(XRealIP)) != 0 {
-		clientIP = r.Header.Get(XRealIP)
+		return xff
 	}
-
+	if realIP := r.Header.Get(XRealIP); realIP != "" {
+		return realIP
+	}
+	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
 	return clientIP
 }

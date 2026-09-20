@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,12 +20,12 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-const LICENSE_OWNER = "Alibaba Group Holding Ltd.";
-const LICENSE_MARKER_REGEX = new RegExp(`Copyright [0-9]{4} ${LICENSE_OWNER}`);
+const LICENSE_OWNER = "The OpenSandbox Authors";
+const LICENSE_MARKER_REGEX = new RegExp(`Copyright [0-9]{4} (${LICENSE_OWNER}|Alibaba Group Holding Ltd\\.)`);
 
 function buildLicenseText() {
   const year = new Date().getFullYear();
-  return `Copyright ${year} ${LICENSE_OWNER}.
+  return `Copyright ${year} ${LICENSE_OWNER}
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

@@ -21,6 +21,7 @@ export default defineConfig({
     testTimeout: 15 * 60_000,
     hookTimeout: 15 * 60_000,
     // Keep ordering deterministic (mirrors ordered Python/Java E2E suites).
+    fileParallelism: false,
     sequence: {
       concurrent: false,
     },

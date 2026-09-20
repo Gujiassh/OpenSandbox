@@ -5,9 +5,8 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/helm-release-test.yml'
-      - '.github/workflows/publish-helm-chart.yml'
-      - 'kubernetes/charts/**'
-      - 'scripts/release/*helm*.sh'
+      - 'manifests/charts/**'
+      - 'manifests/release/*helm*.sh'
       - 'sdks/code-interpreter/python/**'
       - 'sdks/sandbox/python/**'
       - 'tests/python/**'
@@ -69,7 +68,7 @@ jobs:
         id: package
         run: |
           set -euo pipefail
-          chart_path="kubernetes/charts/opensandbox"
+          chart_path="manifests/charts/opensandbox"
           chart_version="$(awk '$1 == "version:" {gsub(/"/, "", $2); print $2; exit}' "$chart_path/Chart.yaml")"
           app_version="$(awk '$1 == "appVersion:" {gsub(/"/, "", $2); print $2; exit}' "$chart_path/Chart.yaml")"
           package_name="opensandbox-${chart_version}.tgz"
@@ -78,7 +77,7 @@ jobs:
           helm lint "$chart_path"
           mkdir -p dist
           helm package "$chart_path" --destination dist
-          scripts/release/verify-helm-package.sh \
+          manifests/release/verify-helm-package.sh \
             "dist/$package_name" opensandbox "$chart_version" "$app_version"
           package_sha256="$(sha256sum "dist/$package_name" | awk '{print $1}')"
           printf '%s  %s\n' "$package_sha256" "$package_name" >dist/SHA256SUMS
@@ -90,23 +89,31 @@ jobs:
         run: |
           set -euo pipefail
 
-          helm template opensandbox-server kubernetes/charts/opensandbox-server \
-            --show-only templates/server.yaml >/tmp/opensandbox-server-rendered.yaml
+          helm template opensandbox-server manifests/charts/server \
+            --show-only templates/deployment.yaml >/tmp/opensandbox-server-rendered.yaml
           grep -qx '  replicas: 1' /tmp/opensandbox-server-rendered.yaml
           grep -qx '    type: Recreate' /tmp/opensandbox-server-rendered.yaml
 
           helm template opensandbox "dist/$PACKAGE_NAME" \
-            --show-only charts/opensandbox-server/templates/server.yaml \
+            --show-only charts/opensandbox-server/templates/deployment.yaml \
             >/tmp/opensandbox-umbrella-server-rendered.yaml
           grep -qx '  replicas: 1' /tmp/opensandbox-umbrella-server-rendered.yaml
           grep -qx '    type: Recreate' /tmp/opensandbox-umbrella-server-rendered.yaml
 
       - name: Run exact-package Kind smoke
+        # The packaged chart defaults to release-<appVersion> images, which only
+        # exist after the umbrella release publishes them — so deployment-level
+        # verification is a release-window activity, not a per-PR one. PRs run
+        # the package/metadata/render checks above; dispatch this workflow after
+        # the umbrella release to run the full kind smoke against published
+        # images. (Historically PRs passed by accident: legacy v-tag images
+        # existed in registries.)
+        if: github.event_name == 'workflow_dispatch'
         env:
           PACKAGE_NAME: ${{ steps.package.outputs.package_name }}
         run: |
-          scripts/release/smoke-helm-release.sh \
-            --package "dist/$PACKAGE_NAME" -- scripts/release/run-helm-release-e2e.sh
+          manifests/release/smoke-helm-release.sh \
+            --package "dist/$PACKAGE_NAME" -- manifests/release/run-helm-release-e2e.sh
 
       - name: Upload candidate and diagnostics
         if: ${{ always() }}

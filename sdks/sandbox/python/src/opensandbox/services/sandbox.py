@@ -40,6 +40,12 @@ from opensandbox.models.sandboxes import (
     SnapshotInfo,
     Volume,
 )
+from opensandbox.models.templates import (
+    CreateTemplateRequest,
+    PagedTemplateInfos,
+    TemplateFilter,
+    TemplateInfo,
+)
 
 
 class Sandboxes(Protocol):
@@ -85,6 +91,36 @@ class Sandboxes(Protocol):
             volumes: Optional list of volume mounts for persistent storage.
             secure_access: Whether to enable secured access for sandbox endpoints.
             lifecycle: Optional pre-start and periodic lifecycle hooks.
+
+        Returns:
+            Sandbox create response
+
+        Raises:
+            SandboxException: if the operation fails
+        """
+        ...
+
+    async def create_sandbox_from_template(
+        self,
+        template_id: str,
+        timeout: timedelta,
+        metadata: dict[str, str] | None = None,
+        network_policy: NetworkPolicy | None = None,
+        extensions: dict[str, str] | None = None,
+    ) -> SandboxCreateResponse:
+        """
+        Create a sandbox from a ``Succeeded`` fsb template.
+
+        Template mode fixes the workload shape on the server: only metadata,
+        network policy and extensions may accompany the template id, and the
+        timeout is required.
+
+        Args:
+            template_id: Succeeded fsb template to create the sandbox from
+            timeout: Sandbox lifetime (required in template mode)
+            metadata: User-defined metadata used for management and filtering
+            network_policy: Optional outbound network policy (egress)
+            extensions: Opaque extension parameters passed through to the server as-is
 
         Returns:
             Sandbox create response
@@ -252,6 +288,50 @@ class Sandboxes(Protocol):
 
     async def delete_snapshot(self, snapshot_id: str) -> None:
         """Delete a snapshot."""
+        ...
+
+    async def create_template(self, request: CreateTemplateRequest) -> TemplateInfo:
+        """
+        Create a fsb template (golden-image build).
+
+        The build runs asynchronously: the response carries
+        ``status.phase: Pending``; poll ``get_template`` until ``Succeeded``
+        (or ``Failed``). Only ``Succeeded`` templates can back template-based
+        sandbox creation.
+
+        Raises:
+            SandboxException: if the operation fails
+        """
+        ...
+
+    async def get_template(self, template_id: str) -> TemplateInfo:
+        """
+        Get one template with its latest build status.
+
+        Raises:
+            SandboxException: if the operation fails
+        """
+        ...
+
+    async def list_templates(self, filter: TemplateFilter) -> PagedTemplateInfos:
+        """
+        List the current tenant's templates with optional metadata filtering
+        (AND logic) and pagination.
+
+        Raises:
+            SandboxException: if the operation fails
+        """
+        ...
+
+    async def delete_template(self, template_id: str) -> None:
+        """
+        Delete a template.
+
+        Sandboxes already created from the template are unaffected.
+
+        Raises:
+            SandboxException: if the operation fails
+        """
         ...
 
     def invalidate_endpoint_cache(self, sandbox_id: str) -> None:

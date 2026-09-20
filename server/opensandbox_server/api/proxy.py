@@ -62,7 +62,6 @@ SERVER_GENERATED_RESPONSE_HEADERS = {
     "server",
 }
 
-# Headers that shouldn't be forwarded to untrusted/internal backends
 SENSITIVE_HEADERS = {
     "authorization",
     "cookie",
@@ -100,8 +99,9 @@ def _build_proxy_target_url(
 ) -> str:
     """Build the backend URL from an endpoint plus optional path/query suffix.
 
-    For HTTP, ``query_string`` is omitted from the URL so httpx can pass it via ``params=``
-    (avoids duplicate encoding issues). For WebSocket, the query is appended to the URI.
+    The raw query is appended as-is for both HTTP and WebSocket. Passing it to httpx
+    via ``params=`` would re-serialize it: repeated keys get regrouped, valueless keys
+    gain ``=``, non-UTF-8 escapes become U+FFFD and ``%20`` turns into ``+``.
     """
     scheme = "ws" if websocket else "http"
     base = endpoint.endpoint.rstrip("/")
@@ -109,7 +109,7 @@ def _build_proxy_target_url(
     url = f"{scheme}://{base}"
     if normalized_path:
         url = f"{url}/{normalized_path}"
-    if query_string and websocket:
+    if query_string:
         url = f"{url}?{query_string}"
     return url
 
@@ -120,11 +120,16 @@ def _filter_proxy_headers(
     *,
     extra_excluded: Optional[set[str]] = None,
     connection_header: Optional[str] = None,
+    internal: bool = False,
 ) -> dict[str, str]:
     """Drop transport/auth headers while preserving app-level headers.
 
     Endpoint-resolved headers are merged for routing, except secure-access
     credentials which callers must explicitly provide on server-proxy requests.
+
+    When *internal* is True the call originates from a server-managed API route
+    (e.g. ``/networkpolicy``) rather than from the external ``/proxy/{port}``
+    path, so egress-auth credentials resolved from the endpoint are preserved.
     """
     excluded = set(HOP_BY_HOP_HEADERS) | set(SENSITIVE_HEADERS) | set(FORWARDED_HEADERS)
     if extra_excluded:
@@ -143,8 +148,17 @@ def _filter_proxy_headers(
     if endpoint_headers:
         endpoint_header_excluded = {
             OPEN_SANDBOX_SECURE_ACCESS_HEADER.lower(),
-            OPEN_SANDBOX_EGRESS_AUTH_HEADER.lower(),
         } | FORWARDED_HEADERS
+        if not internal:
+            endpoint_header_excluded.add(OPEN_SANDBOX_EGRESS_AUTH_HEADER.lower())
+        else:
+            # Strip any inbound egress auth header so caller-supplied values cannot
+            # shadow or duplicate the trusted endpoint token.
+            forwarded = {
+                k: v
+                for k, v in forwarded.items()
+                if k.lower() != OPEN_SANDBOX_EGRESS_AUTH_HEADER.lower()
+            }
         forwarded.update(
             {
                 key: value
@@ -261,14 +275,15 @@ class _ProxyStreamingResponse(StreamingResponse):
         resp: httpx.Response,
         *,
         status_code: int,
-        headers: Mapping[str, str],
+        raw_headers: list[tuple[bytes, bytes]],
     ) -> None:
         self._backend_response = resp
         super().__init__(
             content=_stream_backend_response(resp),
             status_code=status_code,
-            headers=headers,
         )
+        # A mapping would collapse repeated fields such as Set-Cookie.
+        self.raw_headers = raw_headers
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
@@ -317,6 +332,8 @@ async def _proxy_http_request(
     sandbox_id: str,
     port: int,
     full_path: str,
+    *,
+    internal: bool = False,
 ) -> StreamingResponse:
     resolve_internal = get_config().proxy.resolve_internal
     endpoint = lifecycle.sandbox_service.get_endpoint(
@@ -343,6 +360,7 @@ async def _proxy_http_request(
             request.headers,
             endpoint.headers,
             connection_header=request.headers.get("connection"),
+            internal=internal,
         )
         # Forwarded headers are stripped above and rebuilt from the connection
         # observed by this trusted proxy, so clients cannot spoof transport state.
@@ -352,7 +370,6 @@ async def _proxy_http_request(
         req = client.build_request(
             method=request.method,
             url=target_url,
-            params=query_string if query_string else None,
             headers=headers,
             content=request.stream() if stream_body else None,
         )
@@ -369,20 +386,23 @@ async def _proxy_http_request(
                     if header.strip()
                 )
             response_header_exclusions = hop_by_hop | SERVER_GENERATED_RESPONSE_HEADERS
-            response_headers = {
-                key: (
-                    _rewrite_proxy_location(value, request, sandbox_id, port)
-                    if key.lower() == "location"
-                    else value
+            response_headers = [
+                (
+                    key.lower(),
+                    _rewrite_proxy_location(
+                        value.decode("latin-1"), request, sandbox_id, port
+                    ).encode("latin-1")
+                    if key.lower() == b"location"
+                    else value,
                 )
-                for key, value in resp.headers.items()
-                if key.lower() not in response_header_exclusions
-            }
+                for key, value in resp.headers.raw
+                if key.decode("latin-1").lower() not in response_header_exclusions
+            ]
 
             return _ProxyStreamingResponse(
                 resp,
                 status_code=resp.status_code,
-                headers=response_headers,
+                raw_headers=response_headers,
             )
         except BaseException:
             # Until ownership passes to _ProxyStreamingResponse, any failure
@@ -520,10 +540,8 @@ async def _proxy_websocket_request(
         )
     except HTTPException as exc:
         logger.warning(
-            "Rejecting websocket proxy request for sandbox=%s port=%s: %s",
-            sandbox_id,
-            port,
-            exc.detail,
+            f"Rejecting websocket proxy request for sandbox={sandbox_id} "
+            f"port={port}: {exc.detail}"
         )
         await _fail_client_websocket(
             websocket,
@@ -586,25 +604,19 @@ async def _proxy_websocket_request(
                 )
     except websockets.InvalidStatus as exc:
         logger.warning(
-            "Backend websocket handshake failed for sandbox=%s port=%s: %s",
-            sandbox_id,
-            port,
-            exc,
+            f"Backend websocket handshake failed for sandbox={sandbox_id} "
+            f"port={port}: {exc}"
         )
         await _fail_client_websocket(websocket, status.WS_1008_POLICY_VIOLATION, "")
     except OSError as exc:
         logger.warning(
-            "Could not connect websocket proxy for sandbox=%s port=%s: %s",
-            sandbox_id,
-            port,
-            exc,
+            f"Could not connect websocket proxy for sandbox={sandbox_id} "
+            f"port={port}: {exc}"
         )
         await _fail_client_websocket(websocket, status.WS_1011_INTERNAL_ERROR, "")
     except Exception:
         logger.exception(
-            "Unexpected websocket proxy failure for sandbox=%s port=%s",
-            sandbox_id,
-            port,
+            f"Unexpected websocket proxy failure for sandbox={sandbox_id} port={port}"
         )
         await _fail_client_websocket(websocket, status.WS_1011_INTERNAL_ERROR, "")
 

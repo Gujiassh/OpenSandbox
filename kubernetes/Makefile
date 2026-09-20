@@ -1,54 +1,12 @@
-# VERSION defines the project version for the bundle.
-# Update this value when you upgrade the version of your project.
-# To re-generate a bundle for another specific version without changing the standard setup, you can:
-# - use the VERSION as arg of the bundle target (e.g make bundle VERSION=0.0.2)
-# - use environment variables to overwrite this value (e.g export VERSION=0.0.2)
+# VERSION defines the project version. It feeds the image tags. To build for a
+# specific version, pass it as an arg or export it (e.g export VERSION=0.0.2).
+# Helm chart targets live in manifests/Makefile.
 VERSION ?= 0.1.0
 
-# CHANNELS define the bundle channels used in the bundle.
-# Add a new line here if you would like to change its default config. (E.g CHANNELS = "candidate,fast,stable")
-# To re-generate a bundle for other specific channels without changing the standard setup, you can:
-# - use the CHANNELS as arg of the bundle target (e.g make bundle CHANNELS=candidate,fast,stable)
-# - use environment variables to overwrite this value (e.g export CHANNELS="candidate,fast,stable")
-ifneq ($(origin CHANNELS), undefined)
-BUNDLE_CHANNELS := --channels=$(CHANNELS)
-endif
-
-# DEFAULT_CHANNEL defines the default channel used in the bundle.
-# Add a new line here if you would like to change its default config. (E.g DEFAULT_CHANNEL = "stable")
-# To re-generate a bundle for any other default channel without changing the default setup, you can:
-# - use the DEFAULT_CHANNEL as arg of the bundle target (e.g make bundle DEFAULT_CHANNEL=stable)
-# - use environment variables to overwrite this value (e.g export DEFAULT_CHANNEL="stable")
-ifneq ($(origin DEFAULT_CHANNEL), undefined)
-BUNDLE_DEFAULT_CHANNEL := --default-channel=$(DEFAULT_CHANNEL)
-endif
-BUNDLE_METADATA_OPTS ?= $(BUNDLE_CHANNELS) $(BUNDLE_DEFAULT_CHANNEL)
-
-# IMAGE_TAG_BASE defines the docker.io namespace and part of the image name for remote images.
-# This variable is used to construct full image tags for bundle and catalog images.
-#
-# For example, running 'make bundle-build bundle-push catalog-build catalog-push' will build and push both
-# opensandbox.io/sandbox-k8s-bundle:$VERSION and opensandbox.io/sandbox-k8s-catalog:$VERSION.
+# IMAGE_TAG_BASE defines the registry namespace and part of the image name for remote images.
+# This variable is used to construct full image tags for build and push targets.
 IMAGE_TAG_BASE ?= sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/controller
 
-# BUNDLE_IMG defines the image:tag used for the bundle.
-# You can use it as an arg. (E.g make bundle-build BUNDLE_IMG=<some-registry>/<project-name-bundle>:<tag>)
-BUNDLE_IMG ?= $(IMAGE_TAG_BASE)-bundle:v$(VERSION)
-
-# BUNDLE_GEN_FLAGS are the flags passed to the operator-sdk generate bundle command
-BUNDLE_GEN_FLAGS ?= -q --overwrite --version $(VERSION) $(BUNDLE_METADATA_OPTS)
-
-# USE_IMAGE_DIGESTS defines if images are resolved via tags or digests
-# You can enable this value if you would like to use SHA Based Digests
-# To enable set flag to true
-USE_IMAGE_DIGESTS ?= false
-ifeq ($(USE_IMAGE_DIGESTS), true)
-	BUNDLE_GEN_FLAGS += --use-image-digests
-endif
-
-# Set the Operator SDK version to use. By default, what is installed on the system is used.
-# This is useful for CI or a project to utilize a specific version of the operator-sdk toolkit.
-OPERATOR_SDK_VERSION ?= v1.42.0
 # Image URL to use all building/pushing image targets
 # CONTROLLER_IMG defines the image for the controller manager.
 CONTROLLER_IMG ?= controller:dev
@@ -59,9 +17,9 @@ IMAGE_COMMITTER_IMG ?= image-committer:dev
 # SNAPSHOT_REGISTRY defines the OCI registry used by the controller for snapshot images.
 SNAPSHOT_REGISTRY ?= docker-registry.default.svc.cluster.local:5000
 
-# Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
+# Go installs tools in GOBIN, or in the first GOPATH entry's bin directory.
 ifeq (,$(shell go env GOBIN))
-GOBIN=$(shell go env GOPATH)/bin
+GOBIN=$(shell go env GOPATH | cut -d: -f1)/bin
 else
 GOBIN=$(shell go env GOBIN)
 endif
@@ -106,6 +64,7 @@ help: ## Display this help.
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
 	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	$(MAKE) -C ../manifests helm-gen-crds
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -132,22 +91,20 @@ E2E_TIMEOUT ?= 60m
 
 .PHONY: install-kind
 install-kind: ## Install Kind using go install if not already installed
-	@if command -v kind >/dev/null 2>&1; then \
-		echo "Kind is already installed: $$(kind version)"; \
-	else \
+	@if ! command -v "$(KIND)" >/dev/null 2>&1; then \
 		echo "Installing Kind..."; \
-		go install sigs.k8s.io/kind@v0.20.0 && \
-		echo "Kind installed successfully: $$(kind version)"; \
+		GOBIN="$(GOBIN)" go install sigs.k8s.io/kind@v0.20.0; \
 	fi
+	@"$(KIND)" version
 
 .PHONY: setup-test-e2e
 setup-test-e2e: install-kind ## Set up a Kind cluster for e2e tests if it does not exist
-	@case "$$($(KIND) get clusters 2>/dev/null || echo '')" in \
+	@case "$$("$(KIND)" get clusters 2>/dev/null || echo '')" in \
 		*"$(KIND_CLUSTER)"*) \
 			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
 		*) \
 			echo "Creating Kind cluster '$(KIND_CLUSTER)' with Kubernetes version $(KIND_K8S_VERSION)..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) --image kindest/node:$(KIND_K8S_VERSION) ;; \
+			"$(KIND)" create cluster --name $(KIND_CLUSTER) --image kindest/node:$(KIND_K8S_VERSION) ;; \
 	esac
 
 .PHONY: test-e2e-core
@@ -180,7 +137,7 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
-	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+	@"$(KIND)" delete cluster --name $(KIND_CLUSTER)
 
 
 .PHONY: test-e2e-qemu
@@ -226,7 +183,7 @@ setup-gvisor: download-gvisor ## Set up Kind cluster with gVisor (runsc) for e2e
 		export GVISOR_KIND_IMAGE=$(GVISOR_KIND_IMAGE) && \
 		export PWD=$$(pwd) && \
 		envsubst < test/e2e_runtime/gvisor/testdata/gvisor.yaml.tmpl | \
-		$(KIND) create cluster --config -
+		"$(KIND)" create cluster --config -
 	@echo "Creating runsc.toml on Kind nodes..."
 	@for node in $$(docker ps --filter "name=$(GVISOR_KIND_CLUSTER)-" --format "{{.Names}}"); do \
 		docker exec $$node sh -c 'mkdir -p /etc/containerd && echo "[runsc]" > /etc/containerd/runsc.toml && echo "  platform = \"ptrace\"" >> /etc/containerd/runsc.toml'; \
@@ -234,14 +191,14 @@ setup-gvisor: download-gvisor ## Set up Kind cluster with gVisor (runsc) for e2e
 
 .PHONY: cleanup-gvisor
 cleanup-gvisor: ## Tear down gVisor Kind cluster
-	@$(KIND) delete cluster --name $(GVISOR_KIND_CLUSTER) 2>/dev/null || true
+	@"$(KIND)" delete cluster --name $(GVISOR_KIND_CLUSTER) 2>/dev/null || true
 
 # install-gvisor-deps installs CRDs and controller for gVisor tests
 .PHONY: install-gvisor-deps
 install-gvisor-deps:
 	@echo "Building and loading controller image into gVisor Kind cluster..."
 	@$(MAKE) docker-build-controller CONTROLLER_IMG=$(CONTROLLER_IMG)
-	@$(KIND) load docker-image --name $(GVISOR_KIND_CLUSTER) $(CONTROLLER_IMG)
+	@"$(KIND)" load docker-image --name $(GVISOR_KIND_CLUSTER) $(CONTROLLER_IMG)
 	@$(MAKE) install-e2e-deps CONTROLLER_IMG=$(CONTROLLER_IMG)
 
 .PHONY: test-gvisor
@@ -291,9 +248,6 @@ task-executor-run: ## Run task-executor from your host.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
-# docker-build: ## Build docker image with the manager.
-#	$(CONTAINER_TOOL) build -t ${CONTROLLER_IMG} .
-
 docker-build: docker-build-controller
 
 .PHONY: docker-build-controller
@@ -313,9 +267,6 @@ docker-push-image-committer: ## Push docker image for image-committer.
 	$(CONTAINER_TOOL) push ${IMAGE_COMMITTER_IMG}
 
 .PHONY: docker-push
-# docker-push: ## Push docker image with the manager.
-#	$(CONTAINER_TOOL) push ${CONTROLLER_IMG}
-
 docker-push: docker-push-controller
 
 .PHONY: docker-push-controller
@@ -396,7 +347,7 @@ $(LOCALBIN):
 
 ## Tool Binaries
 KUBECTL ?= kubectl
-KIND ?= kind
+KIND ?= $(or $(shell command -v kind 2>/dev/null),$(GOBIN)/kind)
 KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
@@ -454,177 +405,3 @@ mv $(1) $(1)-$(3) ;\
 } ;\
 ln -sf $(1)-$(3) $(1)
 endef
-
-.PHONY: operator-sdk
-OPERATOR_SDK ?= $(LOCALBIN)/operator-sdk
-operator-sdk: ## Download operator-sdk locally if necessary.
-ifeq (,$(wildcard $(OPERATOR_SDK)))
-ifeq (, $(shell which operator-sdk 2>/dev/null))
-	@{ \
-	set -e ;\
-	mkdir -p $(dir $(OPERATOR_SDK)) ;\
-	OS=$(shell go env GOOS) && ARCH=$(shell go env GOARCH) && \
-	curl -sSLo $(OPERATOR_SDK) https://github.com/operator-framework/operator-sdk/releases/download/$(OPERATOR_SDK_VERSION)/operator-sdk_$${OS}_$${ARCH} ;\
-	chmod +x $(OPERATOR_SDK) ;\
-	}
-else
-OPERATOR_SDK = $(shell which operator-sdk)
-endif
-endif
-
-.PHONY: bundle
-bundle: manifests kustomize operator-sdk ## Generate bundle manifests and metadata, then validate generated files.
-	$(OPERATOR_SDK) generate kustomize manifests -q
-	cd config/manager && $(KUSTOMIZE) edit set image controller=$(CONTROLLER_IMG)
-	$(KUSTOMIZE) build config/manifests | $(OPERATOR_SDK) generate bundle $(BUNDLE_GEN_FLAGS)
-	$(OPERATOR_SDK) bundle validate ./bundle
-
-.PHONY: bundle-build
-bundle-build: ## Build the bundle image.
-	$(CONTAINER_TOOL) build $(DOCKER_BUILD_ARGS) -f bundle.Dockerfile -t $(BUNDLE_IMG) .
-
-.PHONY: bundle-push
-bundle-push: ## Push the bundle image.
-	$(MAKE) docker-push CONTROLLER_IMG=$(BUNDLE_IMG)
-
-.PHONY: opm
-OPM = $(LOCALBIN)/opm
-opm: ## Download opm locally if necessary.
-ifeq (,$(wildcard $(OPM)))
-ifeq (,$(shell which opm 2>/dev/null))
-	@{ \
-	set -e ;\
-	mkdir -p $(dir $(OPM)) ;\
-	OS=$(shell go env GOOS) && ARCH=$(shell go env GOARCH) && \
-	curl -sSLo $(OPM) https://github.com/operator-framework/operator-registry/releases/download/v1.55.0/$${OS}-$${ARCH}-opm ;\
-	chmod +x $(OPM) ;\
-	}
-else
-OPM = $(shell which opm)
-endif
-endif
-
-# A comma-separated list of bundle images (e.g. make catalog-build BUNDLE_IMGS=example.com/operator-bundle:v0.1.0,example.com/operator-bundle:v0.2.0).
-# These images MUST exist in a registry and be pull-able.
-BUNDLE_IMGS ?= $(BUNDLE_IMG)
-
-# The image tag given to the resulting catalog image (e.g. make catalog-build CATALOG_IMG=example.com/operator-catalog:v0.2.0).
-CATALOG_IMG ?= $(IMAGE_TAG_BASE)-catalog:v$(VERSION)
-
-# Set CATALOG_BASE_IMG to an existing catalog image tag to add $BUNDLE_IMGS to that image.
-ifneq ($(origin CATALOG_BASE_IMG), undefined)
-FROM_INDEX_OPT := --from-index $(CATALOG_BASE_IMG)
-endif
-
-# Build a catalog image by adding bundle images to an empty catalog using the operator package manager tool, 'opm'.
-# This recipe invokes 'opm' in 'semver' bundle add mode. For more information on add modes, see:
-# https://github.com/operator-framework/community-operators/blob/7f1438c/docs/packaging-operator.md#updating-your-existing-operator
-.PHONY: catalog-build
-catalog-build: opm ## Build a catalog image.
-	$(OPM) index add --container-tool $(CONTAINER_TOOL) --mode semver --tag $(CATALOG_IMG) --bundles $(BUNDLE_IMGS) $(FROM_INDEX_OPT)
-
-# Push the catalog image.
-.PHONY: catalog-push
-catalog-push: ## Push a catalog image.
-	$(MAKE) docker-push CONTROLLER_IMG=$(CATALOG_IMG)
-
-##@ Helm
-
-# Helm chart configuration
-HELM_CHART_PATH ?= charts/opensandbox-controller
-HELM_CHART_VERSION ?= $(VERSION)
-
-.PHONY: helm-lint
-helm-lint: ## Lint all Helm charts and verify dependencies
-	@echo "Linting Helm charts..."
-	helm lint charts/opensandbox-controller
-	helm lint charts/opensandbox-server
-	helm lint charts/opensandbox-node-agent
-	helm dependency build charts/opensandbox
-	helm lint charts/opensandbox
-
-.PHONY: helm-template
-helm-template: ## Generate Kubernetes manifests from Helm chart
-	@echo "Generating manifests from Helm chart..."
-	helm template opensandbox-controller $(HELM_CHART_PATH) \
-		--set controller.image.repository=$(IMAGE_TAG_BASE) \
-		--set controller.image.tag=v$(VERSION)
-
-.PHONY: helm-template-debug
-helm-template-debug: ## Generate Kubernetes manifests with debug output
-	@echo "Generating manifests from Helm chart with debug..."
-	helm template opensandbox-controller $(HELM_CHART_PATH) \
-		--set controller.image.repository=$(IMAGE_TAG_BASE) \
-		--set controller.image.tag=v$(VERSION) \
-		--debug
-
-.PHONY: helm-package
-helm-package: ## Package the Helm chart
-	@echo "Packaging Helm chart..."
-	@mkdir -p dist
-	helm package $(HELM_CHART_PATH) -d dist/ --version $(HELM_CHART_VERSION) --app-version $(VERSION)
-
-.PHONY: helm-install
-helm-install: ## Install the Helm chart
-	@echo "Installing Helm chart..."
-	helm install opensandbox-controller $(HELM_CHART_PATH) \
-		--set controller.image.repository=$(IMAGE_TAG_BASE) \
-		--set controller.image.tag=v$(VERSION) \
-		--namespace opensandbox-system \
-		--create-namespace
-
-.PHONY: helm-upgrade
-helm-upgrade: ## Upgrade the Helm chart
-	@echo "Upgrading Helm chart..."
-	helm upgrade opensandbox-controller $(HELM_CHART_PATH) \
-		--set controller.image.repository=$(IMAGE_TAG_BASE) \
-		--set controller.image.tag=v$(VERSION) \
-		--namespace opensandbox-system
-
-.PHONY: helm-uninstall
-helm-uninstall: ## Uninstall the Helm chart
-	@echo "Uninstalling Helm chart..."
-	helm uninstall opensandbox-controller --namespace opensandbox-system
-
-.PHONY: helm-test
-helm-test: ## Run Helm chart tests
-	@echo "Running Helm chart tests..."
-	helm test opensandbox-controller --namespace opensandbox-system
-
-.PHONY: helm-docs
-helm-docs: ## Generate Helm chart documentation for all charts (requires helm-docs)
-	@if command -v helm-docs >/dev/null 2>&1; then \
-		echo "Generating Helm chart documentation..."; \
-		helm-docs --chart-search-root charts/; \
-	else \
-		echo "helm-docs is not installed. Install it with: go install github.com/norwoodj/helm-docs/cmd/helm-docs@latest"; \
-		exit 1; \
-	fi
-
-.PHONY: helm-docs-check
-helm-docs-check: ## Verify Helm chart documentation is up to date (requires helm-docs)
-	@if command -v helm-docs >/dev/null 2>&1; then \
-		echo "Checking Helm chart documentation is up to date..."; \
-		helm-docs --chart-search-root charts/; \
-		if [ -n "$$(git status --porcelain -- charts/ | head -n 1)" ]; then \
-			echo "ERROR: Helm chart documentation is out of date. Run 'make helm-docs' and commit the changes."; \
-			exit 1; \
-		fi; \
-		echo "Helm chart documentation is up to date."; \
-	else \
-		echo "helm-docs is not installed. Install it with: go install github.com/norwoodj/helm-docs/cmd/helm-docs@latest"; \
-		exit 1; \
-	fi
-
-.PHONY: helm-dry-run
-helm-dry-run: ## Perform a dry-run install of the Helm chart
-	@echo "Performing dry-run installation..."
-	helm install opensandbox-controller $(HELM_CHART_PATH) \
-		--set controller.image.repository=$(IMAGE_TAG_BASE) \
-		--set controller.image.tag=v$(VERSION) \
-		--namespace opensandbox-system \
-		--create-namespace \
-		--dry-run --debug
-
-.PHONY: helm-all
-helm-all: helm-lint helm-package ## Run all Helm-related tasks (lint and package)

@@ -24,7 +24,9 @@
 # Parent directory for per-session overlay upper directories.
 upper_root = "/var/lib/execd/isolation"
 
-# Hard limit on total upper directory size across all sessions (bytes).
+# Allocation-time threshold for total overlay upper-directory size (bytes).
+# Existing sessions can write beyond this value.
+# Default: 8 GiB. Set to 0 to disable the allocation check.
 upper_max_bytes = 8589934592  # 8 GiB
 
 # Maximum tar.gz diff output size (bytes). Phase 2.

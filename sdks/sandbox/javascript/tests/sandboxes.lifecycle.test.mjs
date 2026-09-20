@@ -108,3 +108,20 @@ test("createSandbox preserves future lifecycle hooks", async () => {
   assert.deepEqual(requests[0].lifecycle, expectedLifecycle);
   assert.deepEqual(lifecycle, expectedLifecycle);
 });
+
+test("deleteSandbox forwards AbortSignal to the transport", async () => {
+  const controller = new AbortController();
+  let deleteOptions;
+  const adapter = new SandboxesAdapter({
+    async DELETE(path, options) {
+      assert.equal(path, "/sandboxes/{sandboxId}");
+      deleteOptions = options;
+      return { response: new Response(null, { status: 204 }) };
+    },
+  });
+
+  await adapter.deleteSandbox("sandbox-1", controller.signal);
+
+  assert.equal(deleteOptions.params.path.sandboxId, "sandbox-1");
+  assert.equal(deleteOptions.signal, controller.signal);
+});

@@ -32,8 +32,9 @@ import (
 )
 
 type fakeCodeRunner struct {
-	execute          func(request *runtime.ExecuteCodeRequest) error
-	runInBashSession func(_ context.Context, _ *runtime.ExecuteCodeRequest) error
+	execute                func(request *runtime.ExecuteCodeRequest) error
+	runInBashSession       func(_ context.Context, _ *runtime.ExecuteCodeRequest) error
+	validateBashSessionCwd func(_, _ string) error
 }
 
 func (f *fakeCodeRunner) CreateContext(_ *runtime.CreateContextRequest) (string, error) {
@@ -74,6 +75,13 @@ func (f *fakeCodeRunner) CreateBashSession(_ *runtime.CreateContextRequest) (str
 func (f *fakeCodeRunner) RunInBashSession(ctx context.Context, req *runtime.ExecuteCodeRequest) error {
 	if f.runInBashSession != nil {
 		return f.runInBashSession(ctx, req)
+	}
+	return nil
+}
+
+func (f *fakeCodeRunner) ValidateBashSessionCwd(sessionID, cwd string) error {
+	if f.validateBashSessionCwd != nil {
+		return f.validateBashSessionCwd(sessionID, cwd)
 	}
 	return nil
 }
@@ -420,4 +428,27 @@ func TestRunCodeSuccessStillEmitsSSE(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Contains(t, w.Header().Get("Content-Type"), "text/event-stream")
 	require.NotEmpty(t, w.Body.Bytes(), "successful run should write SSE events")
+}
+
+func TestRunInSession_InvalidCwdReturns400(t *testing.T) {
+	previousRunner := codeRunner
+	codeRunner = &fakeCodeRunner{
+		validateBashSessionCwd: func(_, _ string) error {
+			return errors.New(`cannot resolve working directory "$NOPE": path references undefined environment variables: NOPE`)
+		},
+	}
+	t.Cleanup(func() { codeRunner = previousRunner })
+
+	body := []byte(`{"command":"echo hi","cwd":"$NOPE","timeout":0}`)
+	ctx, w := newTestContext(http.MethodPost, "/sessions/session-1/run", body)
+	ctx.Params = append(ctx.Params, gin.Param{Key: "sessionId", Value: "session-1"})
+	ctrl := NewCodeInterpretingController(ctx)
+
+	ctrl.RunInSession()
+
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	var resp model.ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Equal(t, model.ErrorCodeInvalidRequest, resp.Code)
+	require.Contains(t, resp.Message, "NOPE")
 }

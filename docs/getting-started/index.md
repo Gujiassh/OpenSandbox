@@ -56,52 +56,48 @@ For Kotlin/Java, see [Installation](/getting-started/installation).
 
 ## 3. Create and Use a Sandbox
 
+This example uses the sandbox SDK and a standard Python image. If the server has
+an API key configured, set `OPEN_SANDBOX_API_KEY` in your client environment.
+
 ```python
 import asyncio
 from datetime import timedelta
 
-from code_interpreter import CodeInterpreter, SupportedLanguage
 from opensandbox import Sandbox
+from opensandbox.config import ConnectionConfig
 from opensandbox.models import WriteEntry
 
+
 async def main() -> None:
-    # Create a sandbox with code interpreter
     sandbox = await Sandbox.create(
-        "opensandbox/code-interpreter:v1.1.0",
-        entrypoint=["/opt/code-interpreter/code-interpreter.sh"],
-        env={"PYTHON_VERSION": "3.11"},
+        "python:3.12",
         timeout=timedelta(minutes=10),
+        connection_config=ConnectionConfig(
+            domain="localhost:8080",
+            use_server_proxy=True,
+        ),
     )
+    try:
+        execution = await sandbox.commands.run("python -c 'print(1 + 1)'")
+        for output in execution.logs.stdout:
+            print(output.text)
 
-    async with sandbox:
-        # Execute a shell command
-        execution = await sandbox.commands.run("echo 'Hello OpenSandbox!'")
-        print(execution.logs.stdout[0].text)
-
-        # Write and read a file
         await sandbox.files.write_files([
             WriteEntry(path="/tmp/hello.txt", data="Hello World", mode=644)
         ])
-        content = await sandbox.files.read_file("/tmp/hello.txt")
-        print(f"Content: {content}")
+        print(await sandbox.files.read_file("/tmp/hello.txt"))
+    finally:
+        await sandbox.destroy()
 
-        # Run code via the Code Interpreter
-        interpreter = await CodeInterpreter.create(sandbox)
-        result = await interpreter.codes.run(
-            "import sys; print(sys.version); 2 + 2",
-            language=SupportedLanguage.PYTHON,
-        )
-        print(result.result[0].text)  # 4
-
-        await sandbox.kill()
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-::: tip
-Install the Code Interpreter SDK separately: `pip install opensandbox-code-interpreter`
-:::
+`use_server_proxy=True` routes sandbox traffic through the lifecycle server,
+which is useful when the client cannot reach container addresses directly.
+`destroy()` terminates the remote sandbox and closes local SDK resources.
+Closing the client alone does not terminate the remote sandbox.
 
 ## 4. Try the CLI
 
@@ -111,8 +107,10 @@ pip install opensandbox-cli
 osb config init
 osb config set connection.domain localhost:8080
 osb config set connection.protocol http
+osb config set connection.use_server_proxy true
 osb sandbox create --image python:3.12 --timeout 30m -o json
-osb command run <sandbox-id> -o raw -- python -c "print(1 + 1)"
+osb command run <sandbox-id> -o raw --argv -- python -c "print(1 + 1)"
+osb sandbox kill <sandbox-id> -o json
 ```
 
 ## Next Steps
@@ -120,5 +118,6 @@ osb command run <sandbox-id> -o raw -- python -c "print(1 + 1)"
 - [Installation](/getting-started/installation) — Detailed installation for all SDKs and runtimes
 - [Configuration](/getting-started/configuration) — Server configuration reference
 - [Architecture](/architecture/) — How OpenSandbox works under the hood
-- [Guides](/guides/credential-vault) — Feature guides for Credential Vault, Secure Containers, and more
+- [Guides](/guides/) — Client Pool, tracing, diagnostics, and security features
+- [SDK capability matrix](/sdks/#capability-coverage) — Check support before choosing a language
 - [Examples](/examples/) — Real-world usage examples

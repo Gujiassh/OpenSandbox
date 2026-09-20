@@ -22,6 +22,8 @@ export type SandboxErrorCode =
   | "POOL_ACQUIRE_FAILED"
   | "POOL_NOT_RUNNING"
   | "POOL_STATE_STORE_UNAVAILABLE"
+  | "POOL_DESTROYED"
+  | "POOL_DESTROY_INCOMPLETE"
   // Allow server-defined codes as well.
   | (string & {});
 
@@ -41,6 +43,8 @@ export class SandboxError {
   static readonly POOL_ACQUIRE_FAILED: SandboxErrorCode = "POOL_ACQUIRE_FAILED";
   static readonly POOL_NOT_RUNNING: SandboxErrorCode = "POOL_NOT_RUNNING";
   static readonly POOL_STATE_STORE_UNAVAILABLE: SandboxErrorCode = "POOL_STATE_STORE_UNAVAILABLE";
+  static readonly POOL_DESTROYED: SandboxErrorCode = "POOL_DESTROYED";
+  static readonly POOL_DESTROY_INCOMPLETE: SandboxErrorCode = "POOL_DESTROY_INCOMPLETE";
 
   constructor(
     readonly code: SandboxErrorCode,
@@ -178,6 +182,28 @@ export class PoolStateStoreUnavailableException extends SandboxException {
       message,
       cause,
       error: new SandboxError(SandboxError.POOL_STATE_STORE_UNAVAILABLE, message),
+    });
+  }
+}
+
+export class PoolDestroyedException extends SandboxException {
+  readonly name: string = "PoolDestroyedException";
+
+  constructor(poolName: string, state: string) {
+    const message = `Sandbox pool '${poolName}' namespace is ${state}`;
+    super({ message, error: new SandboxError(SandboxError.POOL_DESTROYED, message) });
+  }
+}
+
+export class PoolDestroyIncompleteException extends SandboxException {
+  readonly name: string = "PoolDestroyIncompleteException";
+
+  constructor(poolName: string, cause?: unknown) {
+    const message = `Sandbox pool '${poolName}' destroy did not complete`;
+    super({
+      message,
+      cause,
+      error: new SandboxError(SandboxError.POOL_DESTROY_INCOMPLETE, message),
     });
   }
 }

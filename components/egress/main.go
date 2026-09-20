@@ -50,11 +50,11 @@ func main() {
 	ctx = withLogger(ctx)
 	defer log.Logger.Sync()
 
-	// Fleet profile: multi-sandbox control plane over the slot
+	// Fast Sandbox profile: multi-sandbox control plane over the slot
 	// store and the proxy route. Sidecar stays the default; the two profiles
 	// are mutually exclusive deployment forms.
-	if strings.TrimSpace(os.Getenv(constants.EnvEgressProfile)) == constants.ProfileFleet {
-		runFleetProfile(ctx)
+	if strings.TrimSpace(os.Getenv(constants.EnvEgressProfile)) == constants.ProfileFastSandbox {
+		runFastSandboxProfile(ctx)
 		return
 	}
 
@@ -110,8 +110,9 @@ func main() {
 		log.Infof("loaded %d outbound log skip pattern(s) from /var/egress/rules/log_skip.always", len(logSkipPatterns))
 	}
 
+	var blockedBroadcaster *events.Broadcaster
 	if blockWebhookURL := strings.TrimSpace(os.Getenv(constants.EnvBlockedWebhook)); blockWebhookURL != "" {
-		blockedBroadcaster := events.NewBroadcaster(ctx, events.BroadcasterConfig{QueueSize: 256})
+		blockedBroadcaster = events.NewBroadcaster(context.WithoutCancel(ctx), events.BroadcasterConfig{QueueSize: 256})
 		blockedBroadcaster.AddSubscriber(events.NewWebhookSubscriber(blockWebhookURL))
 		proxy.SetBlockedBroadcaster(blockedBroadcaster)
 		defer blockedBroadcaster.Close()
@@ -150,7 +151,7 @@ func main() {
 		log.Errorf("startup hooks (post) error: %v", err)
 	}
 
-	waitForShutdown(ctx, proxy, policySrv, exemptDst, nftMgr, mitm)
+	waitForShutdown(ctx, proxy, policySrv, exemptDst, nftMgr, mitm, blockedBroadcaster)
 }
 
 func withLogger(ctx context.Context) context.Context {

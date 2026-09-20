@@ -22,7 +22,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, TypeVar
 
 from opensandbox.adapters.factory import AdapterFactory
 from opensandbox.config import ConnectionConfig
@@ -31,9 +31,12 @@ from opensandbox.exceptions import (
     InvalidArgumentException,
     SandboxException,
     SandboxInternalException,
-    SandboxReadyTimeoutException,
 )
 from opensandbox.internal.lifecycle_metrics import report_sandbox_create_metric
+from opensandbox.internal.readiness import (
+    ReadinessBudget,
+    validate_polling_interval,
+)
 from opensandbox.models.diagnostics import DiagnosticContent
 from opensandbox.models.sandboxes import (
     CreateSnapshotRequest,
@@ -41,11 +44,13 @@ from opensandbox.models.sandboxes import (
     NetworkPolicy,
     NetworkRule,
     PlatformSpec,
+    SandboxCreateResponse,
     SandboxEndpoint,
     SandboxImageSpec,
     SandboxInfo,
     SandboxLifecycle,
     SandboxMetrics,
+    SandboxOrigin,
     SandboxRenewResponse,
     SnapshotInfo,
     Volume,
@@ -64,6 +69,33 @@ from opensandbox.services import (
 
 logger = logging.getLogger(__name__)
 
+_T = TypeVar("_T")
+
+
+async def _gather_fail_fast(*awaitables: Awaitable[_T]) -> list[_T]:
+    """Await concurrent coroutines, cancelling the rest once one fails.
+
+    ``asyncio.gather`` propagates the first exception without cancelling the
+    sibling coroutines, so a permanently failing endpoint lookup (401/403 or a
+    non-retryable 404) would leave the sibling endpoint's retry loop polling
+    until the shared readiness deadline, issuing requests against a sandbox
+    that ``create`` is about to clean up. Cancel and await the remaining
+    tasks on the first failure (including cancellation of this task), then
+    let the original exception propagate. Python 3.10 compatible; no
+    ``asyncio.TaskGroup`` (3.11+).
+    """
+    tasks = [asyncio.ensure_future(awaitable) for awaitable in awaitables]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        # return_exceptions suppresses the siblings' CancelledError (and any
+        # concurrent failure) so the original exception is the one re-raised.
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
 
 class Sandbox:
     """
@@ -72,6 +104,9 @@ class Sandbox:
     This class provides a comprehensive interface for interacting with containerized sandbox
     environments, combining lifecycle management with high-level operations for file system
     access, command execution, and real-time monitoring.
+
+    Custom health checks and transports must not block the event loop. Readiness
+    timeout requests cancellation, but custom code that suppresses it may continue.
 
     Key Features:
 
@@ -127,6 +162,7 @@ class Sandbox:
         diagnostics_service: Diagnostics | None = None,
         isolated_service: IsolationService | None = None,
         custom_health_check: Callable[["Sandbox"], Awaitable[bool]] | None = None,
+        origin: str = SandboxOrigin.UNKNOWN,
     ) -> None:
         """
         Internal constructor for Sandbox. Use Sandbox.create() or Sandbox.connect() instead.
@@ -145,6 +181,24 @@ class Sandbox:
         )
         self._custom_health_check = custom_health_check
         self._isolated_service = isolated_service
+        self._origin = origin
+
+    @property
+    def origin(self) -> str:
+        """Origin of this sandbox (see :class:`SandboxOrigin`).
+
+        ``template`` when the sandbox runs on a fsb golden-image template:
+        set locally by ``create_from_template``, and reported by the
+        server's ``OPEN-SANDBOX-ORIGIN`` response header otherwise (also
+        honored for snapshot restores, which boot the template's published
+        artifact set). ``unknown`` for everything else.
+
+        Template-backed sandboxes route egress policy operations through
+        the lifecycle control plane
+        (``/sandboxes/{sandboxId}/networkpolicy``) instead of the
+        sandbox-side egress sidecar.
+        """
+        return self._origin
 
     @property
     def isolation(self) -> IsolationService:
@@ -184,7 +238,16 @@ class Sandbox:
     def credential_vault(self) -> CredentialVault:
         """
         Provides access to sandbox-scoped Credential Vault operations.
+
+        Raises:
+            SandboxException: for template-backed sandboxes (they have no
+                sandbox-side egress sidecar).
         """
+        if self._origin == SandboxOrigin.TEMPLATE:
+            raise SandboxException(
+                "Credential Vault is not available for template-backed "
+                "sandboxes: they have no sandbox-side egress sidecar."
+            )
         return self._egress_service
 
     @property
@@ -386,7 +449,6 @@ class Sandbox:
         issues in context manager cleanup.
         """
         try:
-            # Close transport only when SDK owns it (default transport).
             await self._connection_config.close_transport_if_owned()
             logger.debug(f"Closed resources for sandbox {self.id}")
         except Exception as e:
@@ -427,6 +489,12 @@ class Sandbox:
         except Exception:
             return False
 
+    async def _probe_health(self) -> bool:
+        """Probe readiness without hiding authentication failures."""
+        if self._custom_health_check:
+            return await self._custom_health_check(self)
+        return await self._health_service.ping(self.id)
+
     async def check_ready(
         self,
         timeout: timedelta,
@@ -443,56 +511,21 @@ class Sandbox:
             SandboxReadyTimeoutException: if health check doesn't pass within timeout
             SandboxException: if health check fails
         """
-        logger.info(
-            f"Waiting for sandbox {self.id} to pass health check (timeout: {timeout.total_seconds()}s)"
-        )
+        await self._check_ready(ReadinessBudget(timeout, polling_interval))
 
-        deadline = time.monotonic() + timeout.total_seconds()
-        attempt = 0
-        last_exception: Exception | None = None
-
-        while time.monotonic() < deadline:
-            attempt += 1
-            logger.debug(f"Health check attempt #{attempt} for sandbox {self.id}")
-
-            try:
-                is_healthy = await self.is_healthy()
-                if is_healthy:
-                    logger.info(
-                        f"Sandbox {self.id} passed health check after {attempt} attempts"
-                    )
-                    return
-                last_exception = None
-                logger.debug(f"Health check attempt #{attempt} returned false")
-            except Exception as e:
-                last_exception = e
-                is_healthy = False
-                logger.debug(
-                    f"Health check attempt #{attempt} failed with exception: {e}"
-                )
-
-            if not is_healthy:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                await asyncio.sleep(min(polling_interval.total_seconds(), remaining))
-
-        error_detail = (
-            f"Last error: {last_exception}"
-            if last_exception
-            else "Health check returned false continuously"
-        )
-        connection_detail = (
+    async def _check_ready(self, budget: ReadinessBudget) -> None:
+        context = (
             f"ConnectionConfig(domain={self.connection_config.get_domain()}, "
             f"use_server_proxy={self.connection_config.use_server_proxy})"
         )
-        final_message = (
-            f"Sandbox health check timed out after {timeout.total_seconds()}s "
-            f"({attempt} attempts). {error_detail}. {connection_detail}."
+        # Fast-fail on 401/403 applies only to the built-in /ping probe: a custom
+        # health_check may legitimately poll an app whose authorization becomes
+        # available asynchronously, so it keeps the retry-until-deadline behavior.
+        await budget.health(
+            self._probe_health,
+            context,
+            auth_fail_fast=self._custom_health_check is None,
         )
-
-        logger.error(final_message)
-        raise SandboxReadyTimeoutException(final_message)
 
     @classmethod
     async def create(
@@ -525,7 +558,7 @@ class Sandbox:
         Args:
             image: Container image specification including image reference and optional auth
             timeout: Maximum sandbox lifetime. Pass None to require explicit cleanup.
-            ready_timeout: Maximum time to wait for sandbox to become ready
+            ready_timeout: Total budget for endpoint publication and health checks.
             env: Environment variables for the sandbox
             metadata: Custom metadata for the sandbox
             resource: Resource limits (CPU, memory, etc.)
@@ -539,8 +572,8 @@ class Sandbox:
                 Each volume specifies a backend (host path, PVC, or OSSFS) and mount configuration.
             connection_config: Connection configuration
             health_check: Custom async health check function
-            health_check_polling_interval: Time between health check attempts
-            skip_health_check: If True, do NOT wait for sandbox readiness/health; returned instance may not be ready yet.
+            health_check_polling_interval: Polling interval used while waiting for endpoint publication and readiness/health.
+            skip_health_check: Skip health checks; endpoint publication is still awaited.
             lifecycle: Optional pre-start and periodic lifecycle hooks.
 
         Returns:
@@ -553,6 +586,8 @@ class Sandbox:
             raise InvalidArgumentException(
                 "Exactly one of image or snapshot_id must be specified"
             )
+        if not skip_health_check:
+            validate_polling_interval(health_check_polling_interval)
 
         config = (connection_config or ConnectionConfig()).with_transport_if_missing()
         entrypoint = entrypoint or ["tail", "-f", "/dev/null"]
@@ -571,14 +606,16 @@ class Sandbox:
         logger.info(
             f"Creating sandbox with startup source: {startup_source} (timeout: {timeout_log})"
         )
-        factory = AdapterFactory(config)
-        sandbox_id: str | None = None
-        sandbox_service: Sandboxes | None = None
-        create_started = time.monotonic()
 
-        try:
-            sandbox_service = factory.create_sandbox_service()
-            response = await sandbox_service.create_sandbox(
+        return await cls._launch(
+            config=config,
+            startup_source=startup_source,
+            timeout=timeout,
+            ready_timeout=ready_timeout,
+            health_check=health_check,
+            health_check_polling_interval=health_check_polling_interval,
+            skip_health_check=skip_health_check,
+            create_call=lambda service: service.create_sandbox(
                 spec=image,
                 entrypoint=entrypoint,
                 env=env,
@@ -594,17 +631,146 @@ class Sandbox:
                 snapshot_id=snapshot_id,
                 resource_requests=resource_requests,
                 lifecycle=lifecycle,
-            )
+            ),
+        )
+
+    @classmethod
+    async def create_from_template(
+        cls,
+        template_id: str,
+        *,
+        timeout: timedelta,
+        ready_timeout: timedelta = timedelta(seconds=30),
+        metadata: dict[str, str] | None = None,
+        network_policy: NetworkPolicy | None = None,
+        extensions: dict[str, str] | None = None,
+        connection_config: ConnectionConfig | None = None,
+        health_check: Callable[["Sandbox"], Awaitable[bool]] | None = None,
+        health_check_polling_interval: timedelta = timedelta(milliseconds=200),
+        skip_health_check: bool = False,
+    ) -> "Sandbox":
+        """
+        Create a new sandbox from a ``Succeeded`` fsb template.
+
+        Template mode fixes the workload shape on the server: the entrypoint,
+        env, resources, volumes, platform and lifecycle of the sandbox come
+        from the template's golden image and cannot be overridden here. Only
+        metadata, network policy and extensions may accompany the template id,
+        and the timeout is required.
+
+        Args:
+            template_id: ID of a ``Succeeded`` fsb template (see
+                ``SandboxManager.create_template``)
+            timeout: Maximum sandbox lifetime (required in template mode)
+            ready_timeout: Total budget for endpoint publication and health checks.
+            metadata: Custom metadata for the sandbox
+            network_policy: Optional outbound network policy (egress).
+            extensions: Opaque extension parameters passed through to the server as-is.
+                Prefer namespaced keys (e.g. ``storage.id``).
+            connection_config: Connection configuration
+            health_check: Custom async health check function
+            health_check_polling_interval: Polling interval used while waiting for endpoint publication and readiness/health.
+            skip_health_check: Skip health checks; endpoint publication is still awaited.
+
+        Returns:
+            Fully configured and ready Sandbox instance
+
+        Raises:
+            InvalidArgumentException: if template_id is blank
+            SandboxException: if sandbox creation or initialization fails
+        """
+        if not template_id or not template_id.strip():
+            raise InvalidArgumentException("Template ID must be specified")
+        if not skip_health_check:
+            validate_polling_interval(health_check_polling_interval)
+
+        config = (connection_config or ConnectionConfig()).with_transport_if_missing()
+        logger.info(
+            f"Creating sandbox from template: {template_id} "
+            f"(timeout: {timeout.total_seconds()}s)"
+        )
+
+        return await cls._launch(
+            config=config,
+            startup_source=f"template:{template_id}",
+            timeout=timeout,
+            ready_timeout=ready_timeout,
+            health_check=health_check,
+            health_check_polling_interval=health_check_polling_interval,
+            skip_health_check=skip_health_check,
+            create_call=lambda service: service.create_sandbox_from_template(
+                template_id=template_id,
+                timeout=timeout,
+                metadata=metadata,
+                network_policy=network_policy,
+                extensions=extensions,
+            ),
+            origin=SandboxOrigin.TEMPLATE,
+        )
+
+    @classmethod
+    async def _launch(
+        cls,
+        *,
+        config: ConnectionConfig,
+        startup_source: str | None,
+        timeout: timedelta | None,
+        ready_timeout: timedelta,
+        health_check: Callable[["Sandbox"], Awaitable[bool]] | None,
+        health_check_polling_interval: timedelta,
+        skip_health_check: bool,
+        create_call: Callable[[Sandboxes], Awaitable[SandboxCreateResponse]],
+        origin: str = SandboxOrigin.UNKNOWN,
+    ) -> "Sandbox":
+        """Shared create flow: create remote sandbox, gather endpoints, attach, verify readiness."""
+        factory = AdapterFactory(config)
+        sandbox_id: str | None = None
+        sandbox_service: Sandboxes | None = None
+        create_started = time.monotonic()
+
+        try:
+            sandbox_service = factory.create_sandbox_service()
+            response = await create_call(sandbox_service)
             sandbox_id = response.id
 
-            execd_endpoint, egress_endpoint = await asyncio.gather(
-                sandbox_service.get_sandbox_endpoint(
-                    response.id, DEFAULT_EXECD_PORT, config.use_server_proxy
-                ),
-                sandbox_service.get_sandbox_endpoint(
-                    response.id, DEFAULT_EGRESS_PORT, config.use_server_proxy
-                ),
-            )
+            budget = ReadinessBudget(ready_timeout, health_check_polling_interval)
+            if origin == SandboxOrigin.TEMPLATE:
+                # Template-backed (fsb) sandboxes have no sandbox-side egress
+                # sidecar: policy operations go through the lifecycle control
+                # plane.
+                execd_endpoint = await budget.endpoint(
+                    lambda: sandbox_service.get_sandbox_endpoint(
+                        response.id, DEFAULT_EXECD_PORT, config.use_server_proxy
+                    )
+                )
+                egress_service = factory.create_network_policy_service(response.id)
+            else:
+                execd_endpoint, egress_endpoint = await _gather_fail_fast(
+                    budget.endpoint(lambda: sandbox_service.get_sandbox_endpoint(
+                        response.id, DEFAULT_EXECD_PORT, config.use_server_proxy
+                    )),
+                    budget.endpoint(lambda: sandbox_service.get_sandbox_endpoint(
+                        response.id, DEFAULT_EGRESS_PORT, config.use_server_proxy
+                    )),
+                )
+                # The server is authoritative about the runtime backing: for
+                # fsb- prefixed sandboxes it reports `template` even when the
+                # create used a snapshotId (a restore boots the template's
+                # published artifact set). Such sandboxes have no sidecar,
+                # so the egress service is swapped for the control-plane
+                # adapter and the fetched sidecar endpoint goes unused.
+                origin = execd_endpoint.origin or origin
+                if origin == SandboxOrigin.TEMPLATE:
+                    logger.info(
+                        "server reported origin=template for %s; routing "
+                        "egress policy through the lifecycle control plane",
+                        response.id,
+                    )
+                    egress_service = factory.create_network_policy_service(
+                        response.id
+                    )
+                else:
+                    egress_service = factory.create_egress_service(egress_endpoint)
 
             sandbox = cls(
                 sandbox_id=response.id,
@@ -613,17 +779,18 @@ class Sandbox:
                 command_service=factory.create_command_service(execd_endpoint),
                 health_service=factory.create_health_service(execd_endpoint),
                 metrics_service=factory.create_metrics_service(execd_endpoint),
-                egress_service=factory.create_egress_service(egress_endpoint),
+                egress_service=egress_service,
                 diagnostics_service=factory.create_diagnostics_service(),
                 isolated_service=factory.create_isolated_session_service(
                     execd_endpoint
                 ),
                 connection_config=config,
                 custom_health_check=health_check,
+                origin=origin,
             )
 
             if not skip_health_check:
-                await sandbox.check_ready(ready_timeout, health_check_polling_interval)
+                await sandbox._check_ready(budget)
                 logger.info(f"Sandbox {sandbox.id} is ready")
             else:
                 logger.info(
@@ -688,9 +855,9 @@ class Sandbox:
             sandbox_id: ID of the existing sandbox
             connection_config: Connection configuration
             health_check: Custom async health check function
-            connect_timeout: Max time to wait for sandbox readiness/health after connecting.
+            connect_timeout: Total budget for endpoint publication and health checks.
             health_check_polling_interval: Polling interval used while waiting for readiness/health.
-            skip_health_check: If True, do NOT wait for readiness/health; returned instance may not be ready yet.
+            skip_health_check: Skip health checks; endpoint publication is still awaited.
 
         Returns:
             Connected Sandbox instance
@@ -701,7 +868,6 @@ class Sandbox:
         """
         if not sandbox_id:
             raise InvalidArgumentException("Sandbox ID must be specified")
-        # Accept any string identifier.
         sandbox_id = str(sandbox_id)
 
         config = (connection_config or ConnectionConfig()).with_transport_if_missing()
@@ -711,14 +877,21 @@ class Sandbox:
 
         try:
             sandbox_service = factory.create_sandbox_service()
-            execd_endpoint, egress_endpoint = await asyncio.gather(
-                sandbox_service.get_sandbox_endpoint(
-                    sandbox_id, DEFAULT_EXECD_PORT, config.use_server_proxy
-                ),
-                sandbox_service.get_sandbox_endpoint(
+            budget = ReadinessBudget(connect_timeout, health_check_polling_interval)
+            execd_endpoint = await budget.endpoint(lambda: sandbox_service.get_sandbox_endpoint(
+                sandbox_id, DEFAULT_EXECD_PORT, config.use_server_proxy
+            ))
+            origin = execd_endpoint.origin or SandboxOrigin.UNKNOWN
+            if origin == SandboxOrigin.TEMPLATE:
+                # Template-backed (fsb) sandboxes have no sandbox-side egress
+                # sidecar: policy operations go through the lifecycle control
+                # plane, and the egress sidecar endpoint is never resolved.
+                egress_service = factory.create_network_policy_service(sandbox_id)
+            else:
+                egress_endpoint = await budget.endpoint(lambda: sandbox_service.get_sandbox_endpoint(
                     sandbox_id, DEFAULT_EGRESS_PORT, config.use_server_proxy
-                ),
-            )
+                ))
+                egress_service = factory.create_egress_service(egress_endpoint)
 
             sandbox = cls(
                 sandbox_id=sandbox_id,
@@ -727,19 +900,18 @@ class Sandbox:
                 command_service=factory.create_command_service(execd_endpoint),
                 health_service=factory.create_health_service(execd_endpoint),
                 metrics_service=factory.create_metrics_service(execd_endpoint),
-                egress_service=factory.create_egress_service(egress_endpoint),
+                egress_service=egress_service,
                 diagnostics_service=factory.create_diagnostics_service(),
                 isolated_service=factory.create_isolated_session_service(
                     execd_endpoint
                 ),
                 connection_config=config,
                 custom_health_check=health_check,
+                origin=origin,
             )
 
             if not skip_health_check:
-                await sandbox.check_ready(
-                    connect_timeout, health_check_polling_interval
-                )
+                await sandbox._check_ready(budget)
             else:
                 logger.info(
                     f"Connected to sandbox {sandbox_id} (skip_health_check=true, sandbox may not be ready yet)"
@@ -747,9 +919,9 @@ class Sandbox:
 
             logger.info(f"Connected to sandbox {sandbox_id}")
             return sandbox
-        except Exception as e:
+        except BaseException as e:
             await config.close_transport_if_owned()
-            if isinstance(e, SandboxException):
+            if not isinstance(e, Exception) or isinstance(e, SandboxException):
                 raise
             logger.error("Unexpected exception during sandbox connection", exc_info=e)
             raise SandboxInternalException(f"Failed to connect to sandbox: {e}") from e
@@ -775,14 +947,14 @@ class Sandbox:
             sandbox_id: ID of the paused sandbox to resume.
             connection_config: Connection configuration (shared transport, headers, timeouts).
             health_check: Optional custom async health check function (falls back to ping).
-            resume_timeout: Max time to wait for sandbox readiness/health after resuming.
+            resume_timeout: Total budget for endpoint publication and health checks after resuming.
             health_check_polling_interval: Polling interval used while waiting for readiness/health.
-            skip_health_check: If True, do NOT wait for readiness/health; returned instance may not be ready yet.
+            skip_health_check: Skip health checks; endpoint publication is still awaited.
         """
         if not sandbox_id:
             raise InvalidArgumentException("Sandbox ID must be specified")
-        # Accept any string identifier.
         sandbox_id = str(sandbox_id)
+        validate_polling_interval(health_check_polling_interval)
 
         config = (connection_config or ConnectionConfig()).with_transport_if_missing()
 
@@ -793,14 +965,21 @@ class Sandbox:
             sandbox_service = factory.create_sandbox_service()
             await sandbox_service.resume_sandbox(sandbox_id)
 
-            execd_endpoint, egress_endpoint = await asyncio.gather(
-                sandbox_service.get_sandbox_endpoint(
-                    sandbox_id, DEFAULT_EXECD_PORT, config.use_server_proxy
-                ),
-                sandbox_service.get_sandbox_endpoint(
+            budget = ReadinessBudget(resume_timeout, health_check_polling_interval)
+            execd_endpoint = await budget.endpoint(lambda: sandbox_service.get_sandbox_endpoint(
+                sandbox_id, DEFAULT_EXECD_PORT, config.use_server_proxy
+            ))
+            origin = execd_endpoint.origin or SandboxOrigin.UNKNOWN
+            if origin == SandboxOrigin.TEMPLATE:
+                # Template-backed (fsb) sandboxes have no sandbox-side egress
+                # sidecar: policy operations go through the lifecycle control
+                # plane, and the egress sidecar endpoint is never resolved.
+                egress_service = factory.create_network_policy_service(sandbox_id)
+            else:
+                egress_endpoint = await budget.endpoint(lambda: sandbox_service.get_sandbox_endpoint(
                     sandbox_id, DEFAULT_EGRESS_PORT, config.use_server_proxy
-                ),
-            )
+                ))
+                egress_service = factory.create_egress_service(egress_endpoint)
 
             sandbox = cls(
                 sandbox_id=sandbox_id,
@@ -809,26 +988,27 @@ class Sandbox:
                 command_service=factory.create_command_service(execd_endpoint),
                 health_service=factory.create_health_service(execd_endpoint),
                 metrics_service=factory.create_metrics_service(execd_endpoint),
-                egress_service=factory.create_egress_service(egress_endpoint),
+                egress_service=egress_service,
                 diagnostics_service=factory.create_diagnostics_service(),
                 isolated_service=factory.create_isolated_session_service(
                     execd_endpoint
                 ),
                 connection_config=config,
                 custom_health_check=health_check,
+                origin=origin,
             )
 
             if not skip_health_check:
-                await sandbox.check_ready(resume_timeout, health_check_polling_interval)
+                await sandbox._check_ready(budget)
             else:
                 logger.info(
                     f"Resumed sandbox {sandbox_id} (skip_health_check=true, sandbox may not be ready yet)"
                 )
 
             return sandbox
-        except Exception as e:
+        except BaseException as e:
             await config.close_transport_if_owned()
-            if isinstance(e, SandboxException):
+            if not isinstance(e, Exception) or isinstance(e, SandboxException):
                 raise
             logger.error("Unexpected exception during sandbox resume", exc_info=e)
             raise SandboxInternalException(f"Failed to resume sandbox: {e}") from e

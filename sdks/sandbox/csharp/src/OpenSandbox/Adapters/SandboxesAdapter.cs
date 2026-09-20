@@ -42,6 +42,18 @@ internal sealed class SandboxesAdapter : ISandboxes
         _endpointCache = endpointCache;
     }
 
+    /// <summary>
+    /// Percent-encodes a metadata filter for the <c>metadata</c> query parameter.
+    ///
+    /// The HTTP layer percent-encodes the value once more and the server decodes
+    /// its layer before splitting with <c>parse_qsl</c>, so encoding each key and
+    /// value here round-trips keys and values containing <c>&amp;</c>, <c>=</c> or <c>%</c>.
+    /// </summary>
+    internal static string EncodeMetadataFilter(IReadOnlyDictionary<string, string> metadata)
+    {
+        return string.Join("&", metadata.Select(kv => $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value)}"));
+    }
+
     public async Task<CreateSandboxResponse> CreateSandboxAsync(
         CreateSandboxRequest request,
         CancellationToken cancellationToken = default)
@@ -72,9 +84,7 @@ internal sealed class SandboxesAdapter : ISandboxes
 
         if (@params?.Metadata != null && @params.Metadata.Count > 0)
         {
-            // Encode metadata as k=v&k2=v2
-            var metadataStr = string.Join("&", @params.Metadata.Select(kv => $"{kv.Key}={kv.Value}"));
-            queryParts.Add($"metadata={Uri.EscapeDataString(metadataStr)}");
+            queryParts.Add($"metadata={Uri.EscapeDataString(EncodeMetadataFilter(@params.Metadata))}");
         }
 
         if (@params?.Page.HasValue == true)
@@ -213,6 +223,58 @@ internal sealed class SandboxesAdapter : ISandboxes
         await _client.DeleteAsync($"/snapshots/{Uri.EscapeDataString(snapshotId)}", cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task<TemplateInfo> CreateTemplateAsync(
+        CreateTemplateRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var response = await _client.PostAsync<JsonElement>("/templates", request, cancellationToken).ConfigureAwait(false);
+        return ParseTemplateInfo(response);
+    }
+
+    public async Task<TemplateInfo> GetTemplateAsync(
+        string templateId,
+        CancellationToken cancellationToken = default)
+    {
+        var response = await _client.GetAsync<JsonElement>($"/templates/{Uri.EscapeDataString(templateId)}", cancellationToken: cancellationToken).ConfigureAwait(false);
+        return ParseTemplateInfo(response);
+    }
+
+    public async Task<ListTemplatesResponse> ListTemplatesAsync(
+        ListTemplatesParams? @params = null,
+        CancellationToken cancellationToken = default)
+    {
+        var queryParts = new List<string>();
+
+        if (@params?.Metadata != null && @params.Metadata.Count > 0)
+        {
+            queryParts.Add($"metadata={Uri.EscapeDataString(EncodeMetadataFilter(@params.Metadata))}");
+        }
+
+        if (@params?.Page.HasValue == true)
+        {
+            queryParts.Add($"page={@params.Page.Value}");
+        }
+
+        if (@params?.PageSize.HasValue == true)
+        {
+            queryParts.Add($"pageSize={@params.PageSize.Value}");
+        }
+
+        var path = queryParts.Count > 0
+            ? $"/templates?{string.Join("&", queryParts)}"
+            : "/templates";
+
+        var response = await _client.GetAsync<JsonElement>(path, cancellationToken: cancellationToken).ConfigureAwait(false);
+        return ParseListTemplatesResponse(response);
+    }
+
+    public async Task DeleteTemplateAsync(
+        string templateId,
+        CancellationToken cancellationToken = default)
+    {
+        await _client.DeleteAsync($"/templates/{Uri.EscapeDataString(templateId)}", cancellationToken: cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task<Endpoint> GetSandboxEndpointAsync(
         string sandboxId,
         int port,
@@ -244,12 +306,12 @@ internal sealed class SandboxesAdapter : ISandboxes
             ["use_server_proxy"] = useServerProxy ? "true" : "false"
         };
 
-        var response = await _client.GetAsync<JsonElement>(
+        var (response, headers) = await _client.GetWithHeadersAsync<JsonElement>(
             $"/sandboxes/{Uri.EscapeDataString(sandboxId)}/endpoints/{port}",
             queryParams,
-            cancellationToken: cancellationToken).ConfigureAwait(false);
+            cancellationToken).ConfigureAwait(false);
 
-        return ParseEndpointResponse(response);
+        return ParseEndpointResponse(response, headers);
     }
 
     public void InvalidateEndpointCache(string sandboxId)
@@ -270,22 +332,29 @@ internal sealed class SandboxesAdapter : ISandboxes
             ["expires"] = expires.ToString()
         };
 
-        var response = await _client.GetAsync<JsonElement>(
+        var (response, headers) = await _client.GetWithHeadersAsync<JsonElement>(
             $"/sandboxes/{Uri.EscapeDataString(sandboxId)}/endpoints/{port}",
             queryParams,
-            cancellationToken: cancellationToken).ConfigureAwait(false);
+            cancellationToken).ConfigureAwait(false);
 
-        return ParseEndpointResponse(response);
+        return ParseEndpointResponse(response, headers);
     }
 
-    private static Endpoint ParseEndpointResponse(JsonElement response)
+    private static Endpoint ParseEndpointResponse(JsonElement response, IReadOnlyDictionary<string, string>? headers = null)
     {
+        string? origin = null;
+        if (headers != null && headers.TryGetValue(Constants.SandboxOriginHeader, out var originValue) && !string.IsNullOrEmpty(originValue))
+        {
+            origin = originValue;
+        }
+
         return new Endpoint
         {
             EndpointAddress = response.GetProperty("endpoint").GetString() ?? throw new SandboxApiException("Missing endpoint in response"),
             Headers = response.TryGetProperty("headers", out var headersElement) && headersElement.ValueKind == JsonValueKind.Object
                 ? headersElement.EnumerateObject().ToDictionary(p => p.Name, p => p.Value.GetString() ?? string.Empty)
-                : new Dictionary<string, string>()
+                : new Dictionary<string, string>(),
+            Origin = origin
         };
     }
 
@@ -471,6 +540,71 @@ internal sealed class SandboxesAdapter : ISandboxes
         return new RenewSandboxExpirationResponse
         {
             ExpiresAt = expiresAt
+        };
+    }
+
+    private static TemplateInfo ParseTemplateInfo(JsonElement element)
+    {
+        var status = element.GetProperty("status");
+
+        return new TemplateInfo
+        {
+            TemplateId = element.GetProperty("templateId").GetString() ?? throw new SandboxApiException("Missing templateId in response"),
+            Image = element.GetProperty("image").GetString() ?? throw new SandboxApiException("Missing image in response"),
+            Publish = element.GetProperty("publish").GetString() ?? throw new SandboxApiException("Missing publish in response"),
+            Format = element.GetProperty("format").GetString() ?? throw new SandboxApiException("Missing format in response"),
+            Status = new TemplateStatus
+            {
+                Phase = status.GetProperty("phase").GetString() ?? throw new SandboxApiException("Missing status.phase in response"),
+                ManifestRef = status.TryGetProperty("manifestRef", out var manifestRef) && manifestRef.ValueKind != JsonValueKind.Null
+                    ? manifestRef.GetString()
+                    : null,
+                Message = status.TryGetProperty("message", out var message) && message.ValueKind != JsonValueKind.Null
+                    ? message.GetString()
+                    : null
+            },
+            CreatedAt = ParseIsoDate("createdAt", element.GetProperty("createdAt")),
+            UpdatedAt = ParseIsoDate("updatedAt", element.GetProperty("updatedAt")),
+            ResourceLimits = ParseStringMap(element, "resourceLimits"),
+            Entrypoint = element.TryGetProperty("entrypoint", out var entrypoint) && entrypoint.ValueKind == JsonValueKind.Array
+                ? entrypoint.EnumerateArray().Select(e => e.GetString() ?? string.Empty).ToList()
+                : null,
+            Metadata = ParseStringMap(element, "metadata"),
+            Readiness = element.TryGetProperty("readiness", out var readiness) && readiness.ValueKind == JsonValueKind.Object
+                ? new TemplateReadiness
+                {
+                    Probe = readiness.TryGetProperty("probe", out var probe) && probe.ValueKind != JsonValueKind.Null
+                        ? probe.GetString()
+                        : null,
+                    WarmupSeconds = readiness.TryGetProperty("warmupSeconds", out var warmupSeconds) && warmupSeconds.ValueKind == JsonValueKind.Number
+                        ? warmupSeconds.GetInt32()
+                        : null
+                }
+                : null
+        };
+    }
+
+    private static ListTemplatesResponse ParseListTemplatesResponse(JsonElement element)
+    {
+        var items = element.GetProperty("items").EnumerateArray().Select(ParseTemplateInfo).ToList();
+
+        PaginationInfo? pagination = null;
+        if (element.TryGetProperty("pagination", out var paginationElement) && paginationElement.ValueKind == JsonValueKind.Object)
+        {
+            pagination = new PaginationInfo
+            {
+                Page = paginationElement.TryGetProperty("page", out var page) ? page.GetInt32() : 0,
+                PageSize = paginationElement.TryGetProperty("pageSize", out var pageSize) ? pageSize.GetInt32() : 0,
+                TotalItems = paginationElement.TryGetProperty("totalItems", out var totalItems) ? totalItems.GetInt32() : 0,
+                TotalPages = paginationElement.TryGetProperty("totalPages", out var totalPages) ? totalPages.GetInt32() : 0,
+                HasNextPage = paginationElement.TryGetProperty("hasNextPage", out var hasNextPage) && hasNextPage.GetBoolean()
+            };
+        }
+
+        return new ListTemplatesResponse
+        {
+            Items = items,
+            Pagination = pagination
         };
     }
 }

@@ -34,6 +34,11 @@ func (c *Controller) RunInBashSession(_ context.Context, _ *ExecuteCodeRequest) 
 	return errBashSessionNotSupported
 }
 
+// ValidateBashSessionCwd is not supported on Windows.
+func (c *Controller) ValidateBashSessionCwd(_, _ string) error { //nolint:revive
+	return errBashSessionNotSupported
+}
+
 // DeleteBashSession is not supported on Windows.
 func (c *Controller) DeleteBashSession(_ string) error { //nolint:revive
 	return errBashSessionNotSupported

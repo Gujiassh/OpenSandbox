@@ -11,6 +11,8 @@ This section contains the OpenAPI specification documents for the OpenSandbox pr
 
 ### 1. sandbox-lifecycle.yml
 
+[OpenAPI source](https://github.com/opensandbox-group/OpenSandbox/blob/main/specs/sandbox-lifecycle.yml)
+
 **Sandbox Lifecycle Management API**
 
 Defines the complete lifecycle interfaces for creating, managing, and destroying sandbox environments from container images or snapshots.
@@ -19,14 +21,15 @@ Defines the complete lifecycle interfaces for creating, managing, and destroying
 - **Sandbox Management**: Create, list, query, and delete sandbox instances with metadata filters and pagination
 - **State Control**: Pause and resume sandbox execution
 - **Lifecycle States**: Supports transitions across Pending -> Running -> Pausing -> Paused -> Stopping -> Terminated, and error handling with `Failed`
-- **Resource & Runtime Configuration**: Specify CPU/memory/GPU resource limits, image startup `entrypoint`, optional `secureAccess`, environment variables, and opaque `extensions`
+- **Resource & Runtime Configuration**: Specify resource limits and optional Kubernetes `resourceRequests`, image startup `entrypoint`, `platform`, lifecycle hooks, optional `secureAccess`, volumes, environment variables, and opaque `extensions`
 - **Image Support**: Create sandboxes from public or private registries, including registry auth
 - **Timeout Management**: Optional `timeout` on creation (omit or set to `null` to disable automatic expiration) with explicit renewal via API
-- **Endpoint Access**: Retrieve public access endpoints for services running inside sandboxes, including required headers when secured access is enabled
+- **Endpoint Access**: Retrieve public access endpoints for services running inside sandboxes, including required headers when secured access is enabled; endpoint lookups report the sandbox origin via the `OPEN-SANDBOX-ORIGIN` response header (`template` for fsb golden-image sandboxes)
+- **Template Management**: Create, list, inspect, and delete fsb golden-image templates; template builds are asynchronous (poll until `Succeeded`)
 - **Snapshot Management**: Create snapshots from sandboxes, list snapshots with source/name filters, and delete snapshots
 
 **Main Endpoints (base path `/v1`):**
-- `POST /sandboxes` - Create a sandbox from an image or snapshot with timeout and resource limits
+- `POST /sandboxes` - Create a sandbox from an image, snapshot, or template with timeout and resource limits
 - `GET /sandboxes` - List sandboxes with state/metadata filters and pagination
 - `GET /sandboxes/{sandboxId}` - Get full sandbox details (including startup source and entrypoint)
 - `DELETE /sandboxes/{sandboxId}` - Delete a sandbox
@@ -38,7 +41,12 @@ Defines the complete lifecycle interfaces for creating, managing, and destroying
 - `POST /sandboxes/{sandboxId}/resume` - Resume a paused sandbox
 - `POST /sandboxes/{sandboxId}/renew-expiration` - Renew sandbox expiration (TTL)
 - `PATCH /sandboxes/{sandboxId}/metadata` - Patch sandbox metadata (JSON Merge Patch, RFC 7396)
-- `GET /sandboxes/{sandboxId}/endpoints/{port}` - Get an access endpoint for a service port
+- `GET /sandboxes/{sandboxId}/endpoints/{port}` - Get an access endpoint and required headers; supports `use_server_proxy` and signed-endpoint `expires` parameters
+- `GET/PUT/PATCH/DELETE /sandboxes/{sandboxId}/networkpolicy` - Inspect and manage the sandbox egress network policy (Fsb persists intent on the Sandbox CR; other backends proxy the sandbox-side egress service)
+- `POST /templates` - Create a fsb template (asynchronous golden-image build)
+- `GET /templates` - List templates with metadata filters and pagination
+- `GET /templates/{templateId}` - Get template status and artifact references
+- `DELETE /templates/{templateId}` - Delete a template
 
 **Optional `Sandbox.allocation` response field:**
 - Returned only when the runtime confirms the sandbox's current concrete Pool allocation.
@@ -49,25 +57,45 @@ Defines the complete lifecycle interfaces for creating, managing, and destroying
 - HTTP Header: `OPEN-SANDBOX-API-KEY: your-api-key`
 - Environment Variable: `OPEN_SANDBOX_API_KEY` (for SDK clients)
 
-### 2. diagnostic-api.yml
+### 2. diagnostic-api.yml {#diagnostics}
+
+[OpenAPI source](https://github.com/opensandbox-group/OpenSandbox/blob/main/specs/diagnostic-api.yml)
 
 **Sandbox Diagnostics API**
 
 Defines best-effort troubleshooting descriptors for sandbox diagnostic logs and events. The descriptors either embed plain-text diagnostic content inline or return a download URL for the content. This spec does not define a structured audit or observability model.
 
 **Main Endpoints (base path `/v1`):**
-- `GET /sandboxes/{sandboxId}/diagnostics/logs` - Retrieve a diagnostic log content descriptor for an optional scope
-- `GET /sandboxes/{sandboxId}/diagnostics/events` - Retrieve a diagnostic event content descriptor for an optional scope
+- `GET /sandboxes/{sandboxId}/diagnostics/logs` - Retrieve a diagnostic log content descriptor; `scope` is required
+- `GET /sandboxes/{sandboxId}/diagnostics/events` - Retrieve a diagnostic event content descriptor; `scope` is required
 
 **Authentication:**
 - HTTP Header: `OPEN-SANDBOX-API-KEY: your-api-key`
 - Environment Variable: `OPEN_SANDBOX_API_KEY` (for SDK clients)
 
+`scope` is required. Docker and Kubernetes support `container`/`all` for logs and
+`runtime`/`all` for events. Fast Sandbox supports `runtime`/`all` events; log
+collection is not implemented there. Unsupported scopes return
+`DIAGNOSTICS_SCOPE_UNSUPPORTED`.
+
+Responses use `delivery: inline` with `content`, or `delivery: url` with
+`contentUrl` and an optional expiry. The SDK does not download URL content;
+inspect `truncated` and `warnings` before treating results as complete.
+Python models and CLI JSON/YAML use snake_case fields such as `content_url`.
+CLI raw output prints the content or URL without following it.
+
+See [SDK diagnostics](/sdks/#diagnostics) for language support and
+[CLI diagnostics](/cli/#collect-diagnostics) for command examples.
+
 ### 3. execd-api.yaml
+
+[OpenAPI source](https://github.com/opensandbox-group/OpenSandbox/blob/main/specs/execd-api.yaml)
 
 **Code Execution API Inside Sandbox**
 
-Defines interfaces for executing code, commands, and file operations within sandbox environments, providing complete code interpreter and filesystem management capabilities. All endpoints require the `X-EXECD-ACCESS-TOKEN` header.
+Defines interfaces for executing code, commands, and file operations within sandbox environments, providing complete code interpreter and filesystem management capabilities. Forward the headers returned by lifecycle endpoint resolution, including
+`X-EXECD-ACCESS-TOKEN` when required. Do not hard-code an execd address or assume
+the lifecycle API key alone authorizes direct sandbox access.
 
 **Core Features:**
 - **Code Execution**: Stateful code execution supporting Python, JavaScript, and other languages with context lifecycle management
@@ -122,12 +150,13 @@ Defines interfaces for executing code, commands, and file operations within sand
 
 **Isolated Execution (base path `/v1/isolated`):**
 - `POST /session` - Create an isolated bash session
+- `GET /sessions` - List isolated sessions
 - `GET /capabilities` - Get isolator capabilities
 - `GET /session/{sessionId}` - Get isolated session state
 - `DELETE /session/{sessionId}` - Delete an isolated session
-- `POST /session/{sessionId}/run` - Run code in an isolated session (SSE streaming)
-- `GET /session/{sessionId}/diff` - Download upper directory diff
-- `POST /session/{sessionId}/commit` - Commit upper changes to workspace
+- `POST /session/{sessionId}/run` - Run a command in an isolated session (foreground SSE or background execution)
+- `GET/DELETE /session/{sessionId}/runs/{runId}` - Get status or interrupt an isolated run
+- `GET /session/{sessionId}/runs/{runId}/logs` - Retrieve isolated run logs
 - `GET /session/{sessionId}/files/info` - Get file information
 - `GET /session/{sessionId}/files/download` - Download a file
 - `POST /session/{sessionId}/files/upload` - Upload a file
@@ -140,7 +169,15 @@ Defines interfaces for executing code, commands, and file operations within sand
 - `POST /session/{sessionId}/directories` - Create directories
 - `DELETE /session/{sessionId}/directories` - Delete directories
 
+`GET /session/{sessionId}/diff` and `POST /session/{sessionId}/commit` appear
+in the contract but are not implemented in the current execd: both return
+`503` with a not-supported error, and capabilities report `diff_supported: false`
+and `commit_supported: false`. Check `/v1/isolated/capabilities` before using
+runtime-dependent isolation features.
+
 ### 4. egress-api.yaml
+
+[OpenAPI source](https://github.com/opensandbox-group/OpenSandbox/blob/main/specs/egress-api.yaml)
 
 **Sandbox Egress Runtime API**
 
@@ -158,6 +195,14 @@ the sandbox endpoint for the egress port and then calling the sidecar endpoint d
 - `GET /policy` - Get the current egress policy
 - `PATCH /policy` - Merge new egress rules into the current policy
 - `DELETE /policy` - Remove specific egress rules from the current policy by target
+- `POST/GET/PATCH/DELETE /credential-vault` - Create, inspect, mutate, or delete vault state
+- `GET /credential-vault/credentials` and `GET /credential-vault/credentials/{credential_name}` - Read sanitized credential metadata
+- `GET /credential-vault/bindings` and `GET /credential-vault/bindings/{binding_name}` - Read binding metadata
+
+Credential values are write-only. Enable Credential Proxy and an egress policy
+before creating a vault. Template-backed sandboxes have no egress sidecar or
+Credential Vault; their policy operations use the lifecycle `networkpolicy`
+endpoints. See [Credential Vault](/guides/credential-vault).
 
 ## Technical Features
 

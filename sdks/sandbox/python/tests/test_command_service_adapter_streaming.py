@@ -33,6 +33,18 @@ from opensandbox.models.sandboxes import SandboxEndpoint
 
 _UNICODE_SEPARATORS = "before\u0085middle\u2028middle\u2029after"
 
+# Arguments a shell would rewrite: a literal "$HOME", an embedded space, a
+# single quote, and an empty string. They must reach the process verbatim.
+LITERAL_ARGV = [
+    "python3",
+    "-c",
+    "import sys; print(sys.argv[1:])",
+    "a b",
+    "$HOME",
+    "x'y",
+    "",
+]
+
 
 class _SseTransport(httpx.AsyncBaseTransport):
     def __init__(self) -> None:
@@ -66,6 +78,32 @@ class _SseTransport(httpx.AsyncBaseTransport):
             events = [
                 {"type": "init", "text": "exec-unicode", "timestamp": 1},
                 {"type": "stdout", "text": _UNICODE_SEPARATORS, "timestamp": 2},
+                {
+                    "type": "execution_complete",
+                    "timestamp": 3,
+                    "execution_time": 4,
+                },
+            ]
+            sse = b"".join(
+                f"{json.dumps(event, ensure_ascii=False)}\n\n".encode()
+                for event in events
+            )
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                content=sse,
+                request=request,
+            )
+
+        if request.url.path == "/command" and payload.get("argv") == LITERAL_ARGV:
+            # Simulate execd's native argv execution: run the payload as
+            # `python3 -c <code> <args...>` directly (no shell) and stream
+            # back what `print(sys.argv[1:])` produces — with -c, Python's
+            # sys.argv[1:] is exactly the trailing literal arguments.
+            printed = str(payload["argv"][3:]) + "\n"
+            events = [
+                {"type": "init", "text": "exec-argv", "timestamp": 1},
+                {"type": "stdout", "text": printed, "timestamp": 2},
                 {
                     "type": "execution_complete",
                     "timestamp": 3,
@@ -154,6 +192,26 @@ async def test_run_command_streaming_preserves_unicode_separators() -> None:
     assert execution.logs.stdout[0].text == _UNICODE_SEPARATORS
     assert execution.complete is not None
     assert execution.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_run_command_argv_streams_literal_arguments() -> None:
+    transport = _SseTransport()
+    cfg = ConnectionConfig(protocol="http", transport=transport)
+    endpoint = SandboxEndpoint(endpoint="localhost:44772", port=44772)
+    adapter = CommandsAdapter(cfg, endpoint)
+
+    execution = await adapter.run(LITERAL_ARGV)
+
+    assert execution.id == "exec-argv"
+    assert execution.logs.stdout[0].text == str(LITERAL_ARGV[3:]) + "\n"
+    assert "$HOME" in execution.logs.stdout[0].text
+    assert execution.complete is not None
+    assert execution.exit_code == 0
+
+    assert transport.last_request is not None
+    body = json.loads(transport.last_request.content.decode("utf-8"))
+    assert body == {"argv": LITERAL_ARGV}
 
 
 @pytest.mark.asyncio
@@ -363,3 +421,14 @@ async def test_run_foreground_command_still_waits_for_terminator() -> None:
 
     with pytest.raises(SandboxConnectionException):
         await adapter.run("sleep 1", opts=RunCommandOpts(background=False))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", [("tool", "arg"), None, 123])
+async def test_run_rejects_unsupported_command_types(command) -> None:
+    cfg = ConnectionConfig(protocol="http", transport=_SseTransport())
+    endpoint = SandboxEndpoint(endpoint="localhost:44772", port=44772)
+    adapter = CommandsAdapter(cfg, endpoint)
+
+    with pytest.raises(InvalidArgumentException, match="shell text or an argv list"):
+        await adapter.run(command)

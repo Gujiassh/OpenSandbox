@@ -103,11 +103,36 @@ type Sandbox struct {
 	lifecycle *LifecycleClient
 	execd     *ExecdClient
 	egress    *EgressClient
+	origin    SandboxOrigin
 	mu        sync.Mutex
 }
 
 // ID returns the sandbox identifier.
 func (s *Sandbox) ID() string { return s.id }
+
+// Origin reports what backs this sandbox (see SandboxOrigin).
+//
+// SandboxOriginTemplate when the sandbox runs on a fsb golden-image template:
+// set locally by CreateSandboxFromTemplate, and reported by the server's
+// OPEN-SANDBOX-ORIGIN response header otherwise (also honored for snapshot
+// restores, which boot the template's published artifact set).
+// SandboxOriginUnknown for everything else.
+//
+// Template-backed sandboxes route egress policy operations through the
+// lifecycle control plane (/sandboxes/{id}/networkpolicy) instead of the
+// sandbox-side egress sidecar.
+func (s *Sandbox) Origin() SandboxOrigin {
+	if s.origin == "" {
+		return SandboxOriginUnknown
+	}
+	return s.origin
+}
+
+// templateBacked reports whether this sandbox runs on a fsb golden-image
+// template and therefore has no sandbox-side egress sidecar.
+func (s *Sandbox) templateBacked() bool {
+	return s.origin == SandboxOriginTemplate
+}
 
 // CreateSandbox creates a new sandbox and waits for it to be ready.
 func CreateSandbox(ctx context.Context, config ConnectionConfig, opts SandboxCreateOptions) (*Sandbox, error) {
@@ -167,13 +192,118 @@ func CreateSandbox(ctx context.Context, config ConnectionConfig, opts SandboxCre
 		return nil, fmt.Errorf("opensandbox: create sandbox: %w", err)
 	}
 
+	return finishCreate(ctx, config, lc, created, startupSource, SandboxOriginUnknown, opts.readyOptions())
+}
+
+// SandboxFromTemplateOptions configures template-based sandbox creation.
+type SandboxFromTemplateOptions struct {
+	// TimeoutSeconds is the sandbox TTL. Required: the server rejects
+	// template-based creation without a timeout.
+	TimeoutSeconds int
+
+	// Metadata for filtering and tagging.
+	Metadata map[string]string
+
+	// NetworkPolicy for egress control.
+	NetworkPolicy *NetworkPolicy
+
+	// Extensions for provider-specific parameters.
+	Extensions map[string]string
+
+	// SkipHealthCheck skips the WaitUntilReady call after creation.
+	SkipHealthCheck bool
+
+	// ReadyTimeout overrides DefaultReadyTimeoutSeconds.
+	ReadyTimeout time.Duration
+
+	// HealthCheckInterval overrides DefaultHealthCheckPollingInterval.
+	HealthCheckInterval time.Duration
+
+	// HealthCheck is a custom health check function. If nil, execd /ping is used.
+	HealthCheck func(ctx context.Context, sb *Sandbox) (bool, error)
+}
+
+// CreateSandboxFromTemplate creates a new sandbox from a Succeeded fsb
+// template and waits for it to be ready.
+//
+// Template mode fixes the workload shape on the server: the entrypoint, env,
+// resources, volumes, platform and lifecycle of the sandbox come from the
+// template's golden image and cannot be overridden here. Only metadata,
+// network policy and extensions may accompany the template ID, and the
+// timeout is required.
+func CreateSandboxFromTemplate(ctx context.Context, config ConnectionConfig, templateID string, opts SandboxFromTemplateOptions) (*Sandbox, error) {
+	if templateID == "" {
+		return nil, &InvalidArgumentError{Field: "templateID", Message: "template ID is required"}
+	}
+	if opts.TimeoutSeconds <= 0 {
+		return nil, &InvalidArgumentError{Field: "TimeoutSeconds", Message: "timeout is required when creating from a template"}
+	}
+
+	lc := config.lifecycleClient()
+	startupSource := "template:" + templateID
+	started := time.Now()
+
+	req := CreateSandboxRequest{
+		TemplateID:    templateID,
+		Timeout:       &opts.TimeoutSeconds,
+		Metadata:      opts.Metadata,
+		NetworkPolicy: opts.NetworkPolicy,
+		Extensions:    opts.Extensions,
+	}
+
+	created, err := lc.CreateSandbox(ctx, req)
+	if err != nil {
+		reportSandboxCreateMetric(config, "", startupSource, time.Since(started).Milliseconds(), false)
+		return nil, fmt.Errorf("opensandbox: create sandbox from template: %w", err)
+	}
+
+	return finishCreate(ctx, config, lc, created, startupSource, SandboxOriginTemplate, opts.readyOptions())
+}
+
+// readyOptions is the shared subset of create options that controls the
+// post-create readiness flow.
+type readyOptions struct {
+	skipHealthCheck     bool
+	readyTimeout        time.Duration
+	healthCheckInterval time.Duration
+	healthCheck         func(ctx context.Context, sb *Sandbox) (bool, error)
+}
+
+func (o SandboxCreateOptions) readyOptions() readyOptions {
+	return readyOptions{
+		skipHealthCheck:     o.SkipHealthCheck,
+		readyTimeout:        o.ReadyTimeout,
+		healthCheckInterval: o.HealthCheckInterval,
+		healthCheck:         o.HealthCheck,
+	}
+}
+
+func (o SandboxFromTemplateOptions) readyOptions() readyOptions {
+	return readyOptions{
+		skipHealthCheck:     o.SkipHealthCheck,
+		readyTimeout:        o.ReadyTimeout,
+		healthCheckInterval: o.HealthCheckInterval,
+		healthCheck:         o.HealthCheck,
+	}
+}
+
+// finishCreate completes the shared create flow: wait for the sandbox to
+// reach Running, resolve execd, verify readiness, and report create metrics.
+// origin is the locally known sandbox origin (SandboxOriginUnknown unless the
+// caller created the sandbox from a template); the server can refine it via
+// the OPEN-SANDBOX-ORIGIN header during execd resolution. On failure the
+// created sandbox is deleted best-effort.
+func finishCreate(ctx context.Context, config ConnectionConfig, lc *LifecycleClient, created *SandboxInfo, startupSource string, origin SandboxOrigin, opts readyOptions) (*Sandbox, error) {
+	started := time.Now()
+
 	sb := &Sandbox{
 		id:        created.ID,
 		config:    &config,
 		lifecycle: lc,
+		origin:    origin,
 	}
 
-	if err := sb.waitForRunning(ctx, opts.ReadyTimeout); err != nil {
+	if err := sb.waitForRunning(ctx, opts.readyTimeout); err != nil {
 		// Best-effort cleanup
 		_ = lc.DeleteSandbox(context.Background(), created.ID)
 		reportSandboxCreateMetric(config, created.ID, startupSource, time.Since(started).Milliseconds(), false)
@@ -186,11 +316,11 @@ func CreateSandbox(ctx context.Context, config ConnectionConfig, opts SandboxCre
 		return nil, fmt.Errorf("opensandbox: resolve execd: %w", err)
 	}
 
-	if !opts.SkipHealthCheck {
+	if !opts.skipHealthCheck {
 		readyOpts := ReadyOptions{
-			Timeout:         opts.ReadyTimeout,
-			PollingInterval: opts.HealthCheckInterval,
-			HealthCheck:     opts.HealthCheck,
+			Timeout:         opts.readyTimeout,
+			PollingInterval: opts.healthCheckInterval,
+			HealthCheck:     opts.healthCheck,
 		}
 		if err := sb.WaitUntilReady(ctx, readyOpts); err != nil {
 			_ = lc.DeleteSandbox(context.Background(), created.ID)
@@ -203,7 +333,7 @@ func CreateSandbox(ctx context.Context, config ConnectionConfig, opts SandboxCre
 	return sb, nil
 }
 
-// ConnectSandbox connects to an existing running sandbox by ID.
+// ConnectSandbox connects to an existing sandbox by ID.
 func ConnectSandbox(ctx context.Context, config ConnectionConfig, sandboxID string, opts ...ReadyOptions) (*Sandbox, error) {
 	if sandboxID == "" {
 		return nil, &InvalidArgumentError{Field: "sandboxID", Message: "sandbox ID is required"}
@@ -223,12 +353,46 @@ func ConnectSandbox(ctx context.Context, config ConnectionConfig, sandboxID stri
 		lifecycle: lc,
 	}
 
-	if err := sb.resolveExecd(ctx); err != nil {
-		return nil, fmt.Errorf("opensandbox: resolve execd: %w", err)
-	}
-
+	ready := ReadyOptions{}
 	if len(opts) > 0 {
-		if err := sb.WaitUntilReady(ctx, opts[0]); err != nil {
+		ready = opts[0]
+	}
+	timeout, interval := readinessDurations(ready)
+	deadline := time.Now().Add(timeout)
+	waitCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	var lastErr error
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !time.Now().Before(deadline) {
+			return nil, &SandboxReadyTimeoutError{SandboxID: sandboxID, Elapsed: timeout.String(), LastErr: lastErr}
+		}
+		err := sb.resolveExecd(waitCtx)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if err == nil && time.Now().Before(deadline) {
+			break
+		}
+		if err != nil && waitCtx.Err() != nil && lastErr == nil {
+			lastErr = err
+		}
+		if err != nil && waitCtx.Err() == nil {
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.StatusCode != 404 || apiErr.Response.Code != "KUBERNETES::POD_IP_NOT_AVAILABLE" {
+				return nil, err
+			}
+			lastErr = err
+		}
+		select {
+		case <-waitCtx.Done():
+		case <-time.After(readinessSleep(interval, deadline)):
+		}
+	}
+	if len(opts) > 0 {
+		if err := sb.waitUntilReady(ctx, ready, deadline, timeout); err != nil {
 			return nil, err
 		}
 	}
@@ -258,10 +422,8 @@ func (s *Sandbox) Kill(ctx context.Context) error {
 	return s.lifecycle.DeleteSandbox(ctx, s.id)
 }
 
-// Close releases local HTTP resources. Does NOT terminate the sandbox.
+// Close is a no-op; it does not terminate the sandbox.
 func (s *Sandbox) Close() error {
-	// No-op for now — Go's http.Client doesn't need explicit close.
-	// Placeholder for future transport pooling.
 	return nil
 }
 
@@ -324,6 +486,7 @@ func (s *Sandbox) GetSignedEndpoint(ctx context.Context, port int, expires int64
 }
 
 // ReadyOptions configures WaitUntilReady behavior.
+// Timely timeout requires custom health checks and transports to honor context cancellation.
 type ReadyOptions struct {
 	Timeout         time.Duration
 	PollingInterval time.Duration
@@ -333,63 +496,58 @@ type ReadyOptions struct {
 // WaitUntilReady polls until the sandbox is ready or the timeout expires.
 // By default it checks execd /ping; if HealthCheck is provided, it uses that instead.
 func (s *Sandbox) WaitUntilReady(ctx context.Context, opts ReadyOptions) error {
-	timeout := opts.Timeout
+	timeout, _ := readinessDurations(opts)
+	return s.waitUntilReady(ctx, opts, time.Now().Add(timeout), timeout)
+}
+
+func readinessDurations(opts ReadyOptions) (time.Duration, time.Duration) {
+	timeout, interval := opts.Timeout, opts.PollingInterval
 	if timeout == 0 {
 		timeout = time.Duration(DefaultReadyTimeoutSeconds) * time.Second
 	}
-	interval := opts.PollingInterval
-	if interval == 0 {
+	if interval <= 0 {
 		interval = DefaultHealthCheckPollingInterval
 	}
+	return timeout, interval
+}
 
-	deadline := time.Now().Add(timeout)
+func (s *Sandbox) waitUntilReady(ctx context.Context, opts ReadyOptions, deadline time.Time, timeout time.Duration) error {
+	_, interval := readinessDurations(opts)
+	waitCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	var lastErr error
-
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-
 		var healthy bool
+		var err error
 		if opts.HealthCheck != nil {
-			var err error
-			healthy, err = opts.HealthCheck(ctx, s)
-			if err != nil {
-				lastErr = err
-			}
+			healthy, err = opts.HealthCheck(waitCtx, s)
 		} else {
-			err := s.execd.Ping(ctx)
+			err = s.execd.Ping(waitCtx)
 			healthy = err == nil
-			if err != nil {
-				lastErr = err
-			}
 		}
-
-		if healthy {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
+			lastErr = err
+		}
+		if healthy && time.Now().Before(deadline) {
 			return nil
 		}
-
-		// Clamp the sleep to the remaining budget so the final failed check
-		// does not overshoot the timeout by a full polling interval.
-		wait := interval
-		if remaining := time.Until(deadline); remaining < wait {
-			wait = remaining
-		}
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(wait):
+		case <-waitCtx.Done():
+		case <-time.After(readinessSleep(interval, deadline)):
 		}
 	}
-
-	return &SandboxReadyTimeoutError{
-		SandboxID: s.id,
-		Elapsed:   timeout.String(),
-		LastErr:   lastErr,
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
+	return &SandboxReadyTimeoutError{SandboxID: s.id, Elapsed: timeout.String(), LastErr: lastErr}
 }
 
-// waitForRunning polls the lifecycle API until the sandbox reaches Running state.
 func (s *Sandbox) waitForRunning(ctx context.Context, timeout time.Duration) error {
 	if timeout <= 0 {
 		timeout = time.Duration(DefaultReadyTimeoutSeconds) * time.Second
@@ -433,8 +591,6 @@ func (s *Sandbox) waitForRunning(ctx context.Context, timeout time.Duration) err
 	}
 }
 
-// resolveExecd resolves the execd endpoint and creates the ExecdClient.
-// Safe for concurrent use — uses mutex for one-time lazy initialization.
 func (s *Sandbox) resolveExecd(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -443,9 +599,17 @@ func (s *Sandbox) resolveExecd(ctx context.Context) error {
 	}
 
 	useProxy := s.config.UseServerProxy
-	endpoint, err := s.lifecycle.GetEndpoint(ctx, s.id, DefaultExecdPort, &useProxy)
+	endpoint, err := s.lifecycle.getEndpointFromServer(ctx, s.id, DefaultExecdPort, &useProxy)
 	if err != nil {
 		return err
+	}
+
+	// The server is authoritative about the runtime backing: for fsb-
+	// prefixed sandboxes it reports "template" even when the create used a
+	// snapshotId (a restore boots the template's published artifact set).
+	// Never overwrite locally known origin with a missing header.
+	if endpoint.Origin != "" {
+		s.origin = endpoint.Origin
 	}
 
 	execdURL := s.config.RewriteEndpointURL(endpoint.Endpoint)
@@ -469,8 +633,6 @@ func (s *Sandbox) resolveExecd(ctx context.Context) error {
 	return nil
 }
 
-// resolveEgress resolves the egress endpoint and creates the EgressClient.
-// Safe for concurrent use — uses mutex for one-time lazy initialization.
 func (s *Sandbox) resolveEgress(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -503,4 +665,11 @@ func (s *Sandbox) resolveEgress(ctx context.Context) error {
 
 	s.egress = s.config.egressClient(egressURL, headers)
 	return nil
+}
+
+func readinessSleep(interval time.Duration, deadline time.Time) time.Duration {
+	if remaining := time.Until(deadline); remaining < interval {
+		return remaining
+	}
+	return interval
 }

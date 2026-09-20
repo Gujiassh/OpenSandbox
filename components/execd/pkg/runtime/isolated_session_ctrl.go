@@ -63,7 +63,6 @@ type IsolatedRunner struct {
 	pendingStartupCleanup sync.Map // map[sessionID]*isolatedSession
 }
 
-// NewIsolatedRunner creates the isolated session runner.
 func NewIsolatedRunner(ctrl *Controller, iso isolation.Isolator, cfg isolation.Config) (*IsolatedRunner, error) {
 	mgr, err := isolation.NewUpperManager(cfg.UpperRoot, cfg.UpperMaxBytes)
 	if err != nil {
@@ -275,7 +274,9 @@ func (r *IsolatedRunner) StopGC() {
 
 // Close stops new Session admission, waits for in-flight creates, stops the
 // collector, and synchronously attempts cleanup of all runtime-owned sessions.
-// It is safe to call repeatedly; retained cleanup ownership is retried.
+// It is the process-shutdown teardown and is permanent (the runner does not
+// reopen); use Reset to clear sessions while keeping the runner usable.
+// Close is safe to call repeatedly; retained cleanup ownership is retried.
 func (r *IsolatedRunner) Close() error {
 	if r == nil {
 		return nil
@@ -288,6 +289,33 @@ func (r *IsolatedRunner) Close() error {
 	r.admissionMu.Unlock()
 	r.StopGC()
 
+	cleanupErr := r.cleanupSessions()
+	return cleanupErr
+}
+
+// Reset deletes every isolated session while keeping the runner usable:
+// admission re-opens for new sessions and the idle GC loop keeps running.
+// It is the runtime-init counterpart to Close — POST /internal/init must
+// clear the previous generation's sessions without permanently disabling
+// the isolated-session APIs.
+func (r *IsolatedRunner) Reset() error {
+	if r == nil {
+		return nil
+	}
+	r.closeMu.Lock()
+	defer r.closeMu.Unlock()
+
+	r.admissionMu.Lock()
+	r.closed = false
+	r.admissionMu.Unlock()
+
+	return r.cleanupSessions()
+}
+
+// cleanupSessions synchronously attempts cleanup of all runtime-owned
+// sessions plus pending-startup and released-upper retries. Callers hold
+// closeMu.
+func (r *IsolatedRunner) cleanupSessions() error {
 	var cleanupErr error
 	r.ctrl.isolatedSessionMap.Range(func(key, value any) bool {
 		id, idOK := key.(string)
@@ -367,7 +395,6 @@ func (r *IsolatedRunner) CreateIsolatedSession(opts *IsolatedSessionOptions) (st
 	id := uuid.New().String()
 	session := newIsolatedSession(id, opts, r.isolator, r.namespacePinner)
 
-	// Allocate upper directory for overlay mode.
 	if opts.WorkspaceMode == string(isolation.WorkspaceOverlay) || opts.WorkspaceMode == "" {
 		upperID, upperDir, workDir, err := r.upperMgr.Allocate()
 		if err != nil {
@@ -401,7 +428,7 @@ func (r *IsolatedRunner) CreateIsolatedSession(opts *IsolatedSessionOptions) (st
 
 	r.ctrl.isolatedSessionMap.Store(id, session)
 	go r.cleanupExitedSession(id, session)
-	log.Info("created isolated session %s (profile=%s, mode=%s)", id, opts.Profile, opts.WorkspaceMode)
+	log.Info("isolated session: created %s (profile=%s, mode=%s)", id, opts.Profile, opts.WorkspaceMode)
 	return id, nil
 }
 
@@ -416,14 +443,13 @@ func (r *IsolatedRunner) cleanupExitedSession(
 	if current := r.lookup(id); current != session {
 		return
 	}
-	log.Info("isolated session %s exited; starting resource cleanup", id)
+	log.Info("isolated session: %s exited; starting resource cleanup", id)
 	if err := r.DeleteIsolatedSession(id); err != nil &&
 		!errors.Is(err, ErrContextNotFound) {
-		log.Warn("clean up exited isolated session %s: %v", id, err)
+		log.Warn("isolated session: clean up exited %s: %v", id, err)
 	}
 }
 
-// GetIsolatedSession returns session state.
 func (r *IsolatedRunner) GetIsolatedSession(id string) (*IsolatedSessionState, error) {
 	s := r.lookup(id)
 	if s == nil {
@@ -556,7 +582,6 @@ func (r *IsolatedRunner) RunInIsolatedSession(ctx context.Context, id string, co
 		return ErrContextNotFound
 	}
 
-	// Serialize concurrent runs on the same session.
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
 
@@ -708,7 +733,7 @@ func (r *IsolatedRunner) DeleteIsolatedSession(id string) error {
 
 	var cleanupErr error
 	if stopErr := s.stop(); stopErr != nil {
-		log.Warn("stop isolated session %s: %v", id, stopErr)
+		log.Warn("isolated session: stop %s: %v", id, stopErr)
 		cleanupErr = errors.Join(
 			cleanupErr,
 			fmt.Errorf("stop session process: %w", stopErr),
@@ -732,7 +757,7 @@ func (r *IsolatedRunner) DeleteIsolatedSession(id string) error {
 	}
 	if s.upperID != "" {
 		if err := r.upperMgr.Remove(s.upperID); err != nil {
-			log.Warn("remove upper dir for session %s: %v", id, err)
+			log.Warn("isolated session: remove upper dir %s: %v", id, err)
 			cleanupErr = errors.Join(
 				cleanupErr,
 				fmt.Errorf("remove session upper: %w", err),
@@ -748,7 +773,7 @@ func (r *IsolatedRunner) DeleteIsolatedSession(id string) error {
 	if cleanupErr != nil {
 		return cleanupErr
 	}
-	log.Info("deleted isolated session %s", id)
+	log.Info("isolated session: deleted %s", id)
 	return nil
 }
 
@@ -842,7 +867,6 @@ func newMergedView(s *isolatedSession) vfs.FS {
 	return isolation.NewMergedView(s.opts.WorkspacePath, upper, mode, uid, gid)
 }
 
-// Capabilities returns the current isolator capabilities.
 func (r *IsolatedRunner) Capabilities() isolation.Capabilities {
 	return r.isolator.Capabilities()
 }

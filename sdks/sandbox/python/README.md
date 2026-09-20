@@ -119,7 +119,8 @@ pool = SandboxPoolSync(
     state_store=InMemoryPoolStateStore(),  # single-process only
     connection_config=ConnectionConfigSync(domain="api.opensandbox.io"),
     creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
-    reconcile_interval=timedelta(seconds=5),
+    warmup_create_qps=10,
+    warmup_concurrency=128,
 )
 
 pool.start()
@@ -363,7 +364,94 @@ for f in files:
 await sandbox.files.delete_files(["/tmp/hello.txt"])
 ```
 
-### 5. Sandbox Management (Admin)
+### 5. Snapshots
+
+Capture a sandbox's state and restore new sandboxes from it. Snapshots are
+administered through `SandboxManager`:
+
+```python
+from opensandbox.manager import SandboxManager
+from opensandbox.models.sandboxes import SnapshotFilter
+
+async with await SandboxManager.create(connection_config=config) as manager:
+    # Create a snapshot from a running sandbox, then wait until it is Ready
+    snapshot = await manager.create_snapshot(sandbox_id, name="pre-migration")
+
+    info = await manager.get_snapshot(snapshot.id)
+    while info.status.state == "Creating":
+        await asyncio.sleep(2)
+        info = await manager.get_snapshot(snapshot.id)
+    if info.status.state != "Ready":
+        raise RuntimeError(
+            f"snapshot not Ready: state={info.status.state} reason={info.status.reason}"
+        )
+
+    # List all snapshots
+    page = await manager.list_snapshots(SnapshotFilter())
+
+# Restore: create a new sandbox FROM a snapshot (image and snapshot_id are
+# mutually exclusive — set exactly one)
+restored = await Sandbox.create(
+    snapshot_id=snapshot.id,
+    connection_config=config,
+)
+
+# Only delete the snapshot after the restore has succeeded
+async with await SandboxManager.create(connection_config=config) as manager:
+    await manager.delete_snapshot(snapshot.id)
+```
+
+A `Sandbox` can also snapshot itself directly:
+`await sandbox.create_snapshot(name="checkpoint-1")`.
+
+### 6. Isolated Sessions
+
+Isolated sessions run multi-step code in a hardened, resource-bounded
+namespace with bind mounts — reachable through `sandbox.isolation`:
+
+```python
+from opensandbox.models.isolated import (
+    CreateIsolatedSessionRequest,
+    IsolatedRunOpts,
+    IsolatedWorkspaceSpec,
+    BindMount,
+)
+
+session = await sandbox.isolation.create(
+    CreateIsolatedSessionRequest(
+        workspace=IsolatedWorkspaceSpec(path="/workspace", mode="rw"),
+        profile="strict",
+        # Optional bind mounts (source on host, dest inside the session)
+        binds=[BindMount(source="/data", dest="/data", readonly=True)],
+        # Auto-destroy after 10 idle minutes; omitting this leaves the
+        # session alive with no idle GC
+        idle_timeout_seconds=600,
+    )
+)
+try:
+    # Foreground run — timeout_seconds applies here only; background
+    # runs are deliberately not time-limited
+    run = await session.run(
+        "python -c 'print(1+1)'",
+        opts=IsolatedRunOpts(timeout_seconds=30),
+    )
+    print(run.logs.stdout[0].text)
+
+    # Background runs: start, poll until finished, then fetch logs
+    bg = await session.run_background("make build")
+    status = await session.run_status(bg.run_id)
+    while status.running:
+        await asyncio.sleep(2)
+        status = await session.run_status(bg.run_id)
+    logs = await session.run_logs(bg.run_id)
+finally:
+    # Runs even if a foreground run, polling, or log fetch raises —
+    # without this the session leaks (idle GC only fires if
+    # idle_timeout_seconds was set)
+    await session.delete()
+```
+
+### 7. Sandbox Management (Admin)
 
 Use `SandboxManager` for administrative tasks and finding existing sandboxes.
 

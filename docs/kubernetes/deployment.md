@@ -70,12 +70,12 @@ Use an external secret manager instead of creating the Secret manually in produc
 The chart installs the server into `opensandbox-system`, while the default `configToml` creates sandbox and pool resources in `opensandbox`. If you change `[kubernetes].namespace` in `configToml`, create that namespace instead of `opensandbox` before submitting workloads.
 
 ::: warning Single-active Server default
-The chart defaults to `server.replicaCount: 1`. Keep one active Lifecycle
-Server. Multi-replica Server HA is not supported yet, including with a shared
-PostgreSQL database. PostgreSQL-backed Kubernetes HA will be delivered in a
-separate change. The Server Deployment uses the `Recreate` strategy so an
-upgrade stops the active Server before starting its replacement; expect a brief
-API interruption during upgrades.
+The chart defaults to `server.replicaCount: 1`. Keep one active Lifecycle Server
+unless you deliberately use the PostgreSQL-backed Kubernetes public snapshot
+topology documented below. That exception coordinates public snapshots only; it
+does not provide general multi-replica Server HA. The Server Deployment uses the
+`Recreate` strategy so an upgrade stops the active Server before starting its
+replacement; expect a brief API interruption during upgrades.
 :::
 
 ### Use PostgreSQL for server persistence
@@ -91,9 +91,9 @@ kubectl create secret generic opensandbox-postgresql \
 unset OPENSANDBOX_POSTGRESQL_DSN
 ```
 
-In `values-server.yaml`, set `server.replicaCount` to `1`, add the Secret-backed
-environment variable below, and add the shown `[store]` tables to the complete
-`configToml` value:
+In `values-server.yaml`, keep the default `server.replicaCount` at `1`, add the
+Secret-backed environment variable below, and add the shown `[store]` tables to
+the complete `configToml` value:
 
 ```yaml
 server:
@@ -113,11 +113,14 @@ configToml: |
   [store.postgresql]
   min_pool_size = 1
   max_pool_size = 10
+  snapshot_recovery_interval_seconds = 15
 ```
 
-::: warning
-PostgreSQL provides shared persistence, but recovery is not coordinated across
-server replicas. Keep `server.replicaCount: 1` when using PostgreSQL.
+::: info
+The chart default remains one Server replica. You may explicitly set
+`server.replicaCount: 2` for multi-active public snapshot handling only when
+both replicas use the same PostgreSQL database and the Kubernetes runtime.
+SQLite and Docker snapshot execution do not support this multi-active topology.
 :::
 
 ### Install and verify
@@ -196,7 +199,7 @@ helm upgrade opensandbox-server "${CHART_URL}" \
   --values values-server.yaml
 ```
 
-For the complete values reference and local development installation, see the [`opensandbox-server` chart README](https://github.com/opensandbox-group/OpenSandbox/tree/main/kubernetes/charts/opensandbox-server).
+For the complete values reference and local development installation, see the [`opensandbox-server` chart README](https://github.com/opensandbox-group/OpenSandbox/tree/main/manifests/charts/server).
 
 ## Operator Metrics
 
@@ -224,6 +227,29 @@ controller:
   - `opensandbox-metrics-reader` (**not** bound by the chart) — grants `get` on the `/metrics` non-resource URL. Bind it to your scraper's `ServiceAccount` (e.g. Prometheus) and have the scraper present that account's bearer token.
 
 Point your Prometheus stack at the `metrics` container port (for example via a `ServiceMonitor` or `PodMonitoring`).
+
+### Business capacity metrics
+
+The elected controller also exports low-cardinality business capacity metrics over OTLP/HTTP when `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` is set. This is independent of the controller-runtime Prometheus endpoint and remains disabled when neither variable is configured.
+
+```yaml
+extraEnv:
+  - name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
+    value: http://otel-collector.observability:4318/v1/metrics
+```
+
+| Metric | Unit | Attributes | Description |
+|--------|------|------------|-------------|
+| `controller.pool.pods` | `{pod}` | `namespace`, `pool_name`, `state` | Current Pool Pods, where `state` is `total`, `allocated`, `available`, or `updated` |
+| `controller.pool.cpu.requested` | `{cpu}` | `namespace`, `pool_name`, `state` | Scheduler-equivalent CPU requests represented by total, allocated, or available Pool Pods |
+| `controller.pool.memory.requested` | `By` | `namespace`, `pool_name`, `state` | Scheduler-equivalent memory requests represented by total, allocated, or available Pool Pods |
+| `controller.batchsandbox.count` | `{batchsandbox}` | `namespace`, `phase`, `allocation_mode` | Current BatchSandbox objects by lifecycle phase and pool/direct mode |
+| `controller.batchsandbox.pods` | `{pod}` | `namespace`, `state`, `allocation_mode` | Desired, current, allocated, and ready BatchSandbox Pod counts |
+| `controller.capacity.collect.duration` | `s` | None | Time spent reading cached objects and collecting one capacity snapshot |
+
+The metrics deliberately omit sandbox, BatchSandbox, and Pod identifiers. Only the leader exports them, so multiple controller replicas do not duplicate cluster totals. An unset initial BatchSandbox phase is exported as `Unknown`. Derive Pool utilization from `allocated / total` and calculate peak, valley, or percentile capacity in the telemetry backend. Actual CPU and memory usage remains available from kubelet/cAdvisor rather than being duplicated here.
+
+Each collection reads all Pools and BatchSandboxes from the controller manager's informer cache, then performs one cached, owner-UID-indexed Pod list for every non-deleting Pool. Collection CPU and memory therefore grow linearly with the number of cached Pools, BatchSandboxes, and Pool-owned Pods, without issuing one API-server list request per Pool. The OpenTelemetry periodic reader exports every 60 seconds by default; `OTEL_METRIC_EXPORT_INTERVAL` can change the interval in milliseconds. Monitor `controller.capacity.collect.duration` and validate the target cluster scale before shortening that interval. If OTLP setup fails after an endpoint is configured, the controller continues reconciling and logs the failed setup stage together with the endpoint environment variable and a credential-stripped endpoint.
 
 ## Configure the Server for Kubernetes
 

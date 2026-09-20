@@ -27,13 +27,6 @@ import (
 	"github.com/alibaba/opensandbox/ingress/pkg/telemetry"
 )
 
-type Mode string
-
-const (
-	ModeHeader Mode = "header"
-	ModeURI    Mode = "uri"
-)
-
 func (p *Proxy) getSandboxHostDefinition(r *http.Request) (*sandboxHost, int, error) {
 	start := time.Now()
 	host, status, err := p.doGetSandboxHostDefinition(r)
@@ -73,7 +66,7 @@ func (p *Proxy) doGetSandboxHostDefinition(r *http.Request) (*sandboxHost, int, 
 		return nil, ingressRouteErrHTTPStatus(err), fmt.Errorf("invalid ingress route: %w", err)
 	}
 	if _, required := p.sandboxProvider.(sandbox.AuthenticatedRouteProvider); required && pr.namespace == "" {
-		err = fmt.Errorf("%w: fleets provider requires an authenticated route scope", routescope.ErrUnauthorized)
+		err = fmt.Errorf("%w: Fast Sandbox provider requires an authenticated route scope", routescope.ErrUnauthorized)
 		return nil, ingressRouteErrHTTPStatus(err), err
 	}
 
@@ -89,7 +82,10 @@ func (p *Proxy) doGetSandboxHostDefinition(r *http.Request) (*sandboxHost, int, 
 
 	need := endpoint.AccessVerificationRequired()
 
-	if p.mode == ModeURI && !need && pr.uriParsedAsOSEP {
+	// The sandbox does not require secure access, so a four-segment signed path
+	// must not have its leading segments stripped: re-parse as legacy and keep
+	// the full path for the upstream.
+	if p.mode == ModeURI && !need && pr.signedRoute {
 		pr, err = parseURILegacy(r.URL.Path)
 		if err != nil {
 			return nil, ingressRouteErrHTTPStatus(err), err
@@ -141,7 +137,7 @@ func (p *Proxy) parseRequestedHeaderRoute(r *http.Request) (parsedRoute, int, er
 		return parsedRoute{}, http.StatusBadRequest, fmt.Errorf("missing header '%s' or 'Host'", SandboxIngress)
 	}
 	if routescope.IsToken(targetHost) {
-		pr, err := p.parseFleetsScope(targetHost, "")
+		pr, err := p.parseFastSandboxScope(targetHost, "")
 		return pr, 0, err
 	}
 	pr, err := parseHostRoute(targetHost)
@@ -159,7 +155,7 @@ func (p *Proxy) parseRequestedURIRoute(r *http.Request) (parsedRoute, int, error
 		if found && rest != "" {
 			requestURI += rest
 		}
-		pr, err := p.parseFleetsScope(first, requestURI)
+		pr, err := p.parseFastSandboxScope(first, requestURI)
 		if err == nil {
 			pr.requestRawPath = escapedPathSuffix(r.URL.EscapedPath(), 1)
 		}
@@ -170,7 +166,8 @@ func (p *Proxy) parseRequestedURIRoute(r *http.Request) (parsedRoute, int, error
 	if err != nil {
 		return pr, 0, err
 	}
-	if pr.uriParsedAsOSEP {
+	// Signed routes carry four leading route segments; legacy routes two.
+	if pr.signedRoute {
 		pr.requestRawPath = escapedPathSuffix(r.URL.EscapedPath(), 4)
 	} else {
 		pr.requestRawPath = escapedPathSuffix(r.URL.EscapedPath(), 2)
@@ -193,7 +190,7 @@ func escapedPathSuffix(path string, prefixSegments int) string {
 	return "/" + trimmed
 }
 
-func (p *Proxy) parseFleetsScope(token, requestURI string) (parsedRoute, error) {
+func (p *Proxy) parseFastSandboxScope(token, requestURI string) (parsedRoute, error) {
 	if p.scope == nil {
 		return parsedRoute{}, fmt.Errorf("%w: verifier is not configured", routescope.ErrUnauthorized)
 	}
@@ -202,7 +199,7 @@ func (p *Proxy) parseFleetsScope(token, requestURI string) (parsedRoute, error) 
 		return parsedRoute{}, err
 	}
 	return parsedRoute{
-		routeKind:  sandbox.RouteKindFleets,
+		routeKind:  sandbox.RouteKindFastSandbox,
 		namespace:  scope.Namespace,
 		sandboxID:  scope.SandboxID,
 		port:       scope.Port,

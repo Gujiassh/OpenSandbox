@@ -21,7 +21,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from enum import Enum
-from math import ceil
 from typing import TYPE_CHECKING, Protocol, cast
 from uuid import uuid4
 
@@ -66,9 +65,7 @@ _FALLTHROUGH_POLICIES: frozenset[AcquirePolicy] = frozenset(
 )
 
 
-def effective_max_idle_attempts(
-    policy: AcquirePolicy, max_acquire_retries: int
-) -> int:
+def effective_max_idle_attempts(policy: AcquirePolicy, max_acquire_retries: int) -> int:
     """Return the per-acquire cap on idle candidates for ``policy``.
 
     Single-shot policies always try exactly one; retry policies use the configured budget
@@ -336,18 +333,21 @@ class PoolConfig:
     connection_config: ConnectionConfigSync
     creation_spec: PoolCreationSpec
     owner_id: str | None = None
-    warmup_concurrency: int | None = None
+    warmup_create_qps: int = 10
+    warmup_concurrency: int = 128
     primary_lock_ttl: timedelta = timedelta(seconds=60)
-    reconcile_interval: timedelta = timedelta(seconds=30)
     degraded_threshold: int = 3
     acquire_ready_timeout: timedelta = timedelta(seconds=30)
     acquire_health_check_polling_interval: timedelta = timedelta(milliseconds=200)
     acquire_health_check: Callable[[SandboxSync], bool] | None = None
     acquire_skip_health_check: bool = False
     warmup_ready_timeout: timedelta = timedelta(seconds=30)
-    warmup_health_check_polling_interval: timedelta = timedelta(milliseconds=200)
+    warmup_health_check_initial_delay: timedelta = timedelta(0)
+    warmup_health_check_polling_interval: timedelta = timedelta(milliseconds=500)
     warmup_health_check: Callable[[SandboxSync], bool] | None = None
     warmup_sandbox_preparer: Callable[[SandboxSync], None] | None = None
+    warmup_post_prepare_health_check: Callable[[SandboxSync], bool] | None = None
+    warmup_post_prepare_health_check_timeout: timedelta = timedelta(seconds=30)
     warmup_skip_health_check: bool = False
     idle_timeout: timedelta = timedelta(hours=24)
     drain_timeout: timedelta = timedelta(seconds=30)
@@ -357,24 +357,19 @@ class PoolConfig:
 
     def __post_init__(self) -> None:
         owner_id = self.owner_id or f"pool-owner-{uuid4()}"
-        warmup_concurrency = self.warmup_concurrency
-        if warmup_concurrency is None:
-            warmup_concurrency = max(1, ceil(self.max_idle * 0.2))
         object.__setattr__(self, "owner_id", owner_id)
-        object.__setattr__(self, "warmup_concurrency", warmup_concurrency)
 
         _require_text(self.pool_name, "pool_name must not be blank")
         _require_text(owner_id, "owner_id must not be blank")
         if self.max_idle < 0:
             raise ValueError("max_idle must be >= 0")
-        if warmup_concurrency <= 0:
+        if self.warmup_create_qps <= 0:
+            raise ValueError("warmup_create_qps must be positive")
+        if self.warmup_concurrency <= 0:
             raise ValueError("warmup_concurrency must be positive")
         if self.degraded_threshold <= 0:
             raise ValueError("degraded_threshold must be positive")
         _require_positive(self.primary_lock_ttl, "primary_lock_ttl must be positive")
-        _require_positive(
-            self.reconcile_interval, "reconcile_interval must be positive"
-        )
         _require_positive(
             self.acquire_ready_timeout, "acquire_ready_timeout must be positive"
         )
@@ -385,9 +380,15 @@ class PoolConfig:
         _require_positive(
             self.warmup_ready_timeout, "warmup_ready_timeout must be positive"
         )
+        if self.warmup_health_check_initial_delay.total_seconds() < 0:
+            raise ValueError("warmup_health_check_initial_delay must be non-negative")
         _require_positive(
             self.warmup_health_check_polling_interval,
             "warmup_health_check_polling_interval must be positive",
+        )
+        _require_positive(
+            self.warmup_post_prepare_health_check_timeout,
+            "warmup_post_prepare_health_check_timeout must be positive",
         )
         _require_positive(self.idle_timeout, "idle_timeout must be positive")
         if self.drain_timeout.total_seconds() < 0:
@@ -414,18 +415,21 @@ class AsyncPoolConfig:
     connection_config: ConnectionConfig
     creation_spec: PoolCreationSpec
     owner_id: str | None = None
-    warmup_concurrency: int | None = None
+    warmup_create_qps: int = 10
+    warmup_concurrency: int = 128
     primary_lock_ttl: timedelta = timedelta(seconds=60)
-    reconcile_interval: timedelta = timedelta(seconds=30)
     degraded_threshold: int = 3
     acquire_ready_timeout: timedelta = timedelta(seconds=30)
     acquire_health_check_polling_interval: timedelta = timedelta(milliseconds=200)
     acquire_health_check: Callable[[Sandbox], Awaitable[bool]] | None = None
     acquire_skip_health_check: bool = False
     warmup_ready_timeout: timedelta = timedelta(seconds=30)
-    warmup_health_check_polling_interval: timedelta = timedelta(milliseconds=200)
+    warmup_health_check_initial_delay: timedelta = timedelta(0)
+    warmup_health_check_polling_interval: timedelta = timedelta(milliseconds=500)
     warmup_health_check: Callable[[Sandbox], Awaitable[bool]] | None = None
     warmup_sandbox_preparer: Callable[[Sandbox], Awaitable[None]] | None = None
+    warmup_post_prepare_health_check: Callable[[Sandbox], Awaitable[bool]] | None = None
+    warmup_post_prepare_health_check_timeout: timedelta = timedelta(seconds=30)
     warmup_skip_health_check: bool = False
     idle_timeout: timedelta = timedelta(hours=24)
     drain_timeout: timedelta = timedelta(seconds=30)
@@ -435,24 +439,19 @@ class AsyncPoolConfig:
 
     def __post_init__(self) -> None:
         owner_id = self.owner_id or f"pool-owner-{uuid4()}"
-        warmup_concurrency = self.warmup_concurrency
-        if warmup_concurrency is None:
-            warmup_concurrency = max(1, ceil(self.max_idle * 0.2))
         object.__setattr__(self, "owner_id", owner_id)
-        object.__setattr__(self, "warmup_concurrency", warmup_concurrency)
 
         _require_text(self.pool_name, "pool_name must not be blank")
         _require_text(owner_id, "owner_id must not be blank")
         if self.max_idle < 0:
             raise ValueError("max_idle must be >= 0")
-        if warmup_concurrency <= 0:
+        if self.warmup_create_qps <= 0:
+            raise ValueError("warmup_create_qps must be positive")
+        if self.warmup_concurrency <= 0:
             raise ValueError("warmup_concurrency must be positive")
         if self.degraded_threshold <= 0:
             raise ValueError("degraded_threshold must be positive")
         _require_positive(self.primary_lock_ttl, "primary_lock_ttl must be positive")
-        _require_positive(
-            self.reconcile_interval, "reconcile_interval must be positive"
-        )
         _require_positive(
             self.acquire_ready_timeout, "acquire_ready_timeout must be positive"
         )
@@ -463,9 +462,15 @@ class AsyncPoolConfig:
         _require_positive(
             self.warmup_ready_timeout, "warmup_ready_timeout must be positive"
         )
+        if self.warmup_health_check_initial_delay.total_seconds() < 0:
+            raise ValueError("warmup_health_check_initial_delay must be non-negative")
         _require_positive(
             self.warmup_health_check_polling_interval,
             "warmup_health_check_polling_interval must be positive",
+        )
+        _require_positive(
+            self.warmup_post_prepare_health_check_timeout,
+            "warmup_post_prepare_health_check_timeout must be positive",
         )
         _require_positive(self.idle_timeout, "idle_timeout must be positive")
         if self.drain_timeout.total_seconds() < 0:

@@ -1,0 +1,613 @@
+name: Umbrella Release
+
+# OSEP-0016 unified umbrella release — build-hold-publish fan-out.
+#
+# Phase 1 (this file): preflight, version-consistency scan, image builds,
+# and BOM assembly. The BOM commit lands on the release branch
+# through an auto-merge PR from release/<version> — main is protected by a
+# repository ruleset that requires pull requests. Images are tagged
+# release-X.Y.Z and pushed directly by the build jobs; publish-facing
+# behavior (release tags, tags, GitHub Release) is gated behind
+# dry_run=false AND the UMBRELLA_PUBLISH_ENABLED repo variable, which
+# stays unset until GA — until the gates open, images land on run-scoped
+# staging tags instead of release tags.
+#
+# Package legs (PyPI, npm, Maven, NuGet) run through the reusable
+# release-packages.yml workflow: hold-only on dry runs AND on rc
+# builds; ordered verify-then-continue publish only for stable releases
+# with publish gates open AND the BOM PR merged (all images green +
+# code-owner approval). Helm charts
+# are not published — they ship in-repo at the release tag. The legacy
+# tag-triggered publish-* workflows have been deleted; the umbrella is
+# the only release path.
+#
+# Re-runs are idempotent: release tags are treated as immutable. Images,
+# packages, git tags, and the GitHub Release that already exist for the
+# target version are detected and skipped with a ::warning:: annotation
+# instead of being rebuilt, re-published, or overwritten.
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  # serialize runs for the same version (weekly schedule shares one group)
+  # so two dispatches cannot race the BOM force-push/merge on the same
+  # release/<version> branch
+  group: release-umbrella-${{ github.event_name == 'workflow_dispatch' && inputs.version || 'schedule' }}
+  cancel-in-progress: false
+
+on:
+  schedule:
+    # Weekly dry-run (OSEP-0016 test plan): exercises the fan-out so the
+    # chain cannot rot between real release windows. No publish-facing
+    # side effects: component images are built locally, fast-sandbox
+    # images land on run-scoped staging tags, packages are held, no git
+    # tags.
+    - cron: '0 3 * * 3'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Umbrella version, e.g. 1.1.0 or 1.1.0-rc.1'
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run (no publish-facing side effects)'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  resolve:
+    name: Resolve release parameters
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.params.outputs.version }}
+      channel: ${{ steps.params.outputs.channel }}
+      release_branch: ${{ steps.params.outputs.release_branch }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Resolve parameters
+        id: params
+        env:
+          IN_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$IN_VERSION" ]]; then
+            version="$IN_VERSION"
+          else
+            # scheduled dry-run: use the chart version carried by this ref
+            version="$(sed -n 's/^version:[[:space:]]*//p' manifests/charts/opensandbox/Chart.yaml | head -1 | tr -d '"'"'"'')"
+          fi
+          # channel derives from the version suffix (X.Y.Z-rc.N -> rc)
+          if [[ "$version" == *-* ]]; then channel="rc"; else channel="stable"; fi
+          # the BOM PR targets the branch the workflow was dispatched on
+          branch="${GITHUB_REF_NAME}"
+          echo "version=$version"   >> "$GITHUB_OUTPUT"
+          echo "channel=$channel"   >> "$GITHUB_OUTPUT"
+          echo "release_branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "resolved: version=$version channel=$channel branch=$branch"
+
+  # the approval gate must not trigger once the scan already failed; the
+  # scan is skipped on scheduled dry-runs, which must still reach preflight
+  preflight:
+    needs: [resolve, scan]
+    if: ${{ !cancelled() && (needs.scan.result == 'success' || needs.scan.result == 'skipped') }}
+    uses: ./.github/workflows/release-preflight.yml
+    with:
+      # only stable requires the release-environment approval; rc releases
+      # and dry runs run approval-free
+      require_approval: ${{ !inputs.dry_run && needs.resolve.outputs.channel == 'stable' }}
+
+  scan:
+    name: Version-consistency scan
+    if: github.event_name == 'workflow_dispatch'
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Scan version consistency
+        run: |
+          ./manifests/release/create-umbrella-release.sh \
+            --version "${{ needs.resolve.outputs.version }}" \
+            --scan-only \
+            --skip-remote-check
+
+  build-images:
+    name: Build ${{ matrix.component }} image
+    needs: [resolve, preflight, scan]
+    # tolerate the scheduled-run scan skip, but never run after a failure
+    if: ${{ !cancelled() && (needs.scan.result == 'success' || needs.scan.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: server
+            dir: server
+          - component: execd
+            dir: components/execd
+          - component: ingress
+            dir: components/ingress
+          - component: egress
+            dir: components/egress
+          - component: image-committer
+            dir: kubernetes
+          - component: controller
+            dir: kubernetes
+          - component: task-executor
+            dir: kubernetes
+          - component: nodeagent
+            dir: components/nodeagent
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # dry-run builds locally (PUSH=false, single-arch, --load): no
+      # registry credentials are needed and nothing is pushed
+      - name: Login to DockerHub
+        if: inputs.dry_run == false
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Login to ACR
+        if: inputs.dry_run == false
+        uses: docker/login-action@v3
+        with:
+          registry: sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Login to GHCR
+        if: inputs.dry_run == false
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install crane
+        if: inputs.dry_run == false
+        uses: imjasonh/setup-crane@v0.3
+
+      # idempotent re-runs: if the component is already released to every
+      # target registry, skip the build and reuse the existing digest.
+      # Skipped on dry runs so weekly rehearsals always rehearse the build.
+      - name: Check if release images already exist
+        id: already_released
+        if: inputs.dry_run == false
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          set -euo pipefail
+          registries=(
+            "docker.io/opensandbox"
+            "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/opensandbox"
+            "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox"
+          )
+          missing=0
+          for reg in "${registries[@]}"; do
+            if crane manifest "${reg}/${COMPONENT}:release-${VERSION}" >/dev/null 2>&1; then
+              echo "found ${reg}/${COMPONENT}:release-${VERSION}"
+            else
+              missing=1
+            fi
+          done
+          if [[ "$missing" -eq 0 ]]; then
+            echo "::warning::${COMPONENT}:release-${VERSION} already exists in all target registries — skipping build"
+          fi
+          echo "released=$([[ "$missing" -eq 0 ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space
+        if: steps.already_released.outputs.released != 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Build and push image
+        id: build
+        if: steps.already_released.outputs.released != 'true'
+        env:
+          COMPONENT: ${{ matrix.component }}
+          # publish gate: release tags are pushed directly once the repo
+          # variable opens the publish phase; before that, images land on
+          # run-scoped staging tags instead. Dry runs push nothing.
+          IMAGE_TAG: "${{ (inputs.dry_run == false && vars.UMBRELLA_PUBLISH_ENABLED == 'true') && format('release-{0}', needs.resolve.outputs.version) || format('staging-{0}-{1}', github.sha, github.run_id) }}"
+          PUSH: ${{ inputs.dry_run == false }}
+        run: |
+          GHCR_REPO="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/opensandbox"
+          export GHCR_REPO
+          cd "${{ matrix.dir }}"
+          export TAG="$IMAGE_TAG"
+          chmod +x build.sh
+          ./build.sh
+
+          if [ "$PUSH" = "true" ]; then
+            DIGEST="$(docker buildx imagetools inspect "docker.io/opensandbox/${COMPONENT}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
+          else
+            # dry-run: local image ID (config digest) as the rehearsal digest
+            DIGEST="$(docker image inspect --format '{{.Id}}' "opensandbox/${COMPONENT}:${IMAGE_TAG}")"
+          fi
+          if [[ -z "$DIGEST" ]]; then
+            echo "Unable to resolve image digest" >&2
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Record digest in manifest
+        if: steps.already_released.outputs.released != 'true'
+        run: |
+          printf '{"%s": "%s"}\n' \
+            "${{ matrix.component }}" \
+            "${{ steps.build.outputs.digest }}" > "digest-${{ matrix.component }}.json"
+
+      - name: Record existing release digest
+        if: steps.already_released.outputs.released == 'true'
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          set -euo pipefail
+          digest="$(crane digest "docker.io/opensandbox/${COMPONENT}:release-${VERSION}")"
+          printf '{"%s": "%s"}\n' "$COMPONENT" "$digest" > "digest-${COMPONENT}.json"
+
+      - name: Upload digest manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.component }}
+          path: digest-${{ matrix.component }}.json
+          retention-days: 14
+
+  build-fast-sandbox:
+    name: Build fast-sandbox images
+    needs: [resolve, preflight, scan]
+    if: ${{ !cancelled() && (needs.scan.result == 'success' || needs.scan.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Install crane
+        if: inputs.dry_run == false
+        uses: imjasonh/setup-crane@v0.3
+
+      # idempotent re-runs, same rule as build-images: only skip when every
+      # fast-sandbox image is already released to every target registry
+      - name: Check if release images already exist
+        id: already_released
+        if: inputs.dry_run == false
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          images=(fsb-controller fsb-fastlet fsb-fastlet-proxy fsb-janitor fsb-firecracker-runtime fsb-sandboxtemplate-builder)
+          registries=(
+            "docker.io/opensandbox"
+            "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/opensandbox"
+            "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox"
+          )
+          missing=0
+          for img in "${images[@]}"; do
+            for reg in "${registries[@]}"; do
+              if crane manifest "${reg}/${img}:release-${VERSION}" >/dev/null 2>&1; then
+                echo "found ${reg}/${img}:release-${VERSION}"
+              else
+                missing=1
+              fi
+            done
+          done
+          if [[ "$missing" -eq 0 ]]; then
+            echo "::warning::all fast-sandbox release-${VERSION} images already exist in all target registries — skipping build"
+          fi
+          echo "released=$([[ "$missing" -eq 0 ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push images
+        if: steps.already_released.outputs.released != 'true'
+        env:
+          # same publish gate as build-images (release tags once the gate
+          # opens, run-scoped staging tags before that)
+          IMAGE_TAG: "${{ (inputs.dry_run == false && vars.UMBRELLA_PUBLISH_ENABLED == 'true') && format('release-{0}', needs.resolve.outputs.version) || format('staging-{0}-{1}', github.sha, github.run_id) }}"
+        run: |
+          GHCR_REPO="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/opensandbox"
+          export GHCR_REPO
+          # fast-sandbox images publish under the unified opensandbox/*
+          # namespace with an fsb- prefix (fsb-controller disambiguates from
+          # the k8s controller image) and get the full registry mirror set.
+          TAG="$IMAGE_TAG" ./manifests/release/build-fast-sandbox.sh --push
+
+      - name: Record digests in manifest
+        if: steps.already_released.outputs.released != 'true'
+        env:
+          IMAGE_TAG: "${{ (inputs.dry_run == false && vars.UMBRELLA_PUBLISH_ENABLED == 'true') && format('release-{0}', needs.resolve.outputs.version) || format('staging-{0}-{1}', github.sha, github.run_id) }}"
+        run: |
+          jq -n '{}' > digest-fast-sandbox.json
+          for img in fsb-controller fsb-fastlet fsb-fastlet-proxy fsb-janitor fsb-firecracker-runtime fsb-sandboxtemplate-builder; do
+            d="$(docker buildx imagetools inspect "docker.io/opensandbox/${img}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
+            jq --arg k "${img}" --arg v "${d}" '. + {($k): $v}' digest-fast-sandbox.json > tmp.json && mv tmp.json digest-fast-sandbox.json
+          done
+          cat digest-fast-sandbox.json
+
+      - name: Record existing release digests
+        if: steps.already_released.outputs.released == 'true'
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          jq -n '{}' > digest-fast-sandbox.json
+          for img in fsb-controller fsb-fastlet fsb-fastlet-proxy fsb-janitor fsb-firecracker-runtime fsb-sandboxtemplate-builder; do
+            d="$(crane digest "docker.io/opensandbox/${img}:release-${VERSION}")"
+            jq --arg k "${img}" --arg v "${d}" '. + {($k): $v}' digest-fast-sandbox.json > tmp.json && mv tmp.json digest-fast-sandbox.json
+          done
+          cat digest-fast-sandbox.json
+
+      - name: Upload digest manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-fast-sandbox
+          path: digest-fast-sandbox.json
+          retention-days: 14
+
+  packages:
+    name: SDK / CLI / server packages (hold${{ inputs.dry_run == false && vars.UMBRELLA_PUBLISH_ENABLED == 'true' && ' + publish' || '' }})
+    needs: [resolve, preflight, scan, bom]
+    # hold legs still rehearse when the BOM was skipped (e.g. a failed leg
+    # on a dry run), but the publish leg fires only after the BOM PR has
+    # merged — every image green + code-owner approval — so packages can
+    # never go out against a partially-built release
+    if: ${{ !cancelled() && (needs.scan.result == 'success' || needs.scan.result == 'skipped') && (needs.bom.result == 'success' || needs.bom.result == 'skipped') }}
+    # the called workflow's publish leg attests held bytes — grant it
+    # id-token/attestations here or the workflow fails validation
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/release-packages.yml
+    with:
+      version: ${{ needs.resolve.outputs.version }}
+      channel: ${{ needs.resolve.outputs.channel }}
+      # packages are published for stable releases only — rc builds hold
+      # them to validate the fan-out without touching immutable registries
+      #
+      # TODO(GA): with rc holding packages, the publish legs (registry
+      # credentials, verify-then-continue, rollback ledger) execute for
+      # real only at a line's first stable release. Before opening the
+      # gates for 1.1.0, rehearse the publish path end-to-end — e.g. a
+      # staging-registry rehearsal mode, or a one-off gated publish of a
+      # throwaway version per ecosystem — and record the result in the
+      # release runbook.
+      publish: ${{ needs.bom.result == 'success' && inputs.dry_run == false && vars.UMBRELLA_PUBLISH_ENABLED == 'true' && needs.resolve.outputs.channel == 'stable' }}
+    secrets: inherit
+
+  bom:
+    name: Assemble and commit BOM
+    needs: [resolve, build-images, build-fast-sandbox]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.release_branch }}
+          fetch-depth: 0
+
+      - name: Download digest manifests
+        uses: actions/download-artifact@v4
+        with:
+          path: digests
+          pattern: digest-*
+
+      - name: Merge digest manifests
+        run: |
+          jq -s 'add' digests/digest-*/digest-*.json > /tmp/digests.json
+          cat /tmp/digests.json
+
+      - name: Commit BOM and release notes
+        id: bom
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          CHANNEL: ${{ needs.resolve.outputs.channel }}
+          RELEASE_BRANCH: ${{ needs.resolve.outputs.release_branch }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          git config user.name "opensandbox-release-bot"
+          git config user.email "opensandbox-release-bot@users.noreply.github.com"
+          # scheduled dry-runs run on a non-bumped ref: the scan would fail
+          # by design, so it is exercised on dispatch only
+          SKIP=""
+          [[ "$EVENT_NAME" != "schedule" ]] || SKIP="--skip-consistency"
+          base_head="$(git rev-parse HEAD)"
+          ./manifests/release/create-umbrella-release.sh \
+            --version "$VERSION" \
+            --channel "$CHANNEL" \
+            --release-branch "$RELEASE_BRANCH" \
+            --digests-manifest /tmp/digests.json \
+            --no-tags \
+            --skip-remote-check \
+            $SKIP
+          if [[ "$(git rev-parse HEAD)" == "$base_head" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Changes land on the release branch through a pull request: the
+      # bot cannot approve its own PR, so for stable releases this step
+      # opens the BOM PR and waits until a code owner approves; once the
+      # PR is mergeable the bot merges it (rebase, head-SHA-guarded) and
+      # downstream stages continue. rc releases are approval-free: the
+      # bot merges as soon as the PR is mergeable (a branch ruleset that
+      # mandates review still wins — the step then fails fast with a
+      # hint instead of waiting).
+      # Also requires the repo setting "Allow GitHub Actions to create and
+      # approve pull requests" — pull-requests: write alone does not
+      # override it being disabled.
+      - name: Open BOM PR and merge
+        if: steps.bom.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          CHANNEL: ${{ needs.resolve.outputs.channel }}
+          RELEASE_BRANCH: ${{ needs.resolve.outputs.release_branch }}
+          HEAD_BRANCH: release/${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          # bot-owned scratch branch: force-push keeps re-runs of the same
+          # version idempotent
+          git push --force origin "HEAD:refs/heads/${HEAD_BRANCH}"
+          head_sha="$(git rev-parse HEAD)"
+
+          pr_num="$(gh pr list --head "$HEAD_BRANCH" --base "$RELEASE_BRANCH" \
+            --state open --json number --jq '.[0].number // empty' || true)"
+          if [[ -z "$pr_num" ]]; then
+            gh pr create \
+              --base "$RELEASE_BRANCH" \
+              --head "$HEAD_BRANCH" \
+              --title "release(opensandbox): pin BOM for ${VERSION}" \
+              --body "Umbrella release BOM for \`${VERSION}\` (generated by the release-umbrella workflow). Needs one code-owner approval; the workflow merges once review requirements are satisfied."
+            pr_num="$(gh pr view "$HEAD_BRANCH" --json number --jq .number)"
+          fi
+
+          # wait for a human code-owner approval; merge as soon as GitHub
+          # reports the PR mergeable (CLEAN/BEHIND), guard the merge with
+          # --match-head-commit so a concurrent same-version run cannot swap
+          # the head under us (same-version dispatches are additionally
+          # serialized by the workflow concurrency group)
+          # stable waits up to 90 minutes for a code-owner approval;
+          # rc is approval-free — merge as soon as the PR is mergeable,
+          # with a short grace window for transient merge states only
+          if [ "$CHANNEL" = "rc" ]; then
+            echo "rc release: merging BOM PR #${pr_num} without waiting for approval..."
+            deadline=$((SECONDS + 120))
+          else
+            echo "Waiting for code-owner approval on BOM PR #${pr_num}..."
+            deadline=$((SECONDS + 90 * 60))
+          fi
+          while :; do
+            read -r pr_state merge_state <<<"$(gh pr view "$HEAD_BRANCH" \
+              --json state,mergeStateStatus --jq '.state + " " + .mergeStateStatus')"
+            case "$pr_state" in
+              MERGED) echo "BOM PR #${pr_num} merged."; exit 0 ;;
+              CLOSED) echo "BOM PR #${pr_num} was closed without merging." >&2; exit 1 ;;
+            esac
+            case "$merge_state" in
+              CLEAN|BEHIND|HAS_HOOKS)
+                if gh pr merge "$pr_num" --rebase --match-head-commit "$head_sha"; then
+                  echo "BOM PR #${pr_num} merged."
+                  exit 0
+                fi
+                ;;
+            esac
+            if (( SECONDS >= deadline )); then
+              if [ "$CHANNEL" = "rc" ]; then
+                echo "BOM PR #${pr_num} is not mergeable without review (state=${pr_state}/${merge_state})." >&2
+                echo "rc releases are approval-free: if the release-branch ruleset mandates review, add a bypass for the release bot or approve this PR once." >&2
+              else
+                echo "Timed out waiting for approval/merge of BOM PR #${pr_num} (state=${pr_state}/${merge_state})." >&2
+              fi
+              exit 1
+            fi
+            sleep 30
+          done
+
+  release:
+    name: Mint tags and publish GitHub Release
+    needs: [resolve, bom, packages]
+    if: ${{ inputs.dry_run == false && vars.UMBRELLA_PUBLISH_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve.outputs.release_branch }}
+          fetch-depth: 0
+
+      - name: Mint umbrella and Go companion tags
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          CHANNEL: ${{ needs.resolve.outputs.channel }}
+        run: |
+          set -euo pipefail
+          git config user.name "opensandbox-release-bot"
+          git config user.email "opensandbox-release-bot@users.noreply.github.com"
+          # idempotent re-runs: only mint and push tags that are missing on
+          # origin; a locally-created tag from an earlier failed push is
+          # reused instead of re-created
+          new_tags=()
+          if git ls-remote --exit-code origin "refs/tags/release-${VERSION}" >/dev/null 2>&1; then
+            echo "::warning::tag release-${VERSION} already exists on origin — skipping"
+          else
+            git tag -a "release-${VERSION}" -m "release: OpenSandbox ${VERSION}" -m "Umbrella release built from ${GITHUB_SHA}." || true
+            new_tags+=("release-${VERSION}")
+          fi
+          # rc releases ship no SDK artifacts, so no companion tag either
+          if [ "$CHANNEL" = "stable" ]; then
+            go_tag="sdks/sandbox/go/v${VERSION}"
+            if git ls-remote --exit-code origin "refs/tags/${go_tag}" >/dev/null 2>&1; then
+              echo "::warning::tag ${go_tag} already exists on origin — skipping"
+            else
+              git tag -a "$go_tag" -m "release: OpenSandbox Go SDK ${VERSION}" -m "Companion tag for the umbrella release-${VERSION} (same commit)." || true
+              new_tags+=("$go_tag")
+            fi
+          fi
+          if [ "${#new_tags[@]}" -gt 0 ]; then
+            git push origin "${new_tags[@]}"
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "release-${VERSION}" >/dev/null 2>&1; then
+            echo "::warning::GitHub Release release-${VERSION} already exists — skipping"
+            exit 0
+          fi
+          PRERELEASE=""
+          [ "${{ needs.resolve.outputs.channel }}" = "rc" ] && PRERELEASE="--prerelease"
+          gh release create "release-${VERSION}" \
+            --verify-tag $PRERELEASE \
+            --title "OpenSandbox ${VERSION}" \
+            --notes-file "docs/releases/${VERSION}.md" \
+            "docs/releases/${VERSION}.yaml"

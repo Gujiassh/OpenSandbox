@@ -26,6 +26,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 
 from opensandbox.transport import RetryPolicy, RetrySyncTransport
+from opensandbox.transport._deadline_sync import DeadlineSyncTransport
 
 
 class ConnectionConfigSync(BaseModel):
@@ -33,7 +34,7 @@ class ConnectionConfigSync(BaseModel):
     Synchronous connection configuration shared across all sync SDK HTTP clients.
 
     Ownership rules:
-    - If `transport` is not provided, the SDK creates a default HTTPTransport per
+    - If `transport` is not provided, the SDK creates a default transport per
       Sandbox/Manager instance and will close it.
     - If `transport` is provided, the SDK will NOT close it (user owns it).
     """
@@ -53,19 +54,23 @@ class ConnectionConfigSync(BaseModel):
         default=timedelta(seconds=30),
         description="Timeout for HTTP requests to the management API",
     )
-    debug: bool = Field(default=False, description="Enable debug logging for HTTP requests")
+    debug: bool = Field(
+        default=False, description="Enable debug logging for HTTP requests"
+    )
     user_agent: str = Field(
         default="OpenSandbox-Python-SDK/0.1.17.dev0", description="User agent string"
     )
-    headers: dict[str, str] = Field(default_factory=dict, description="User defined headers")
+    headers: dict[str, str] = Field(
+        default_factory=dict, description="User defined headers"
+    )
 
     transport: httpx.BaseTransport | None = Field(
         default=None,
         description=(
             "Shared httpx transport instance used by all HTTP clients within "
-            "a Sandbox/Manager instance. When unset the SDK builds an "
-            "HTTPTransport wrapped by RetrySyncTransport honoring "
-            "`retry_policy`."
+            "a Sandbox/Manager instance. When unset the SDK builds a "
+            "deadline-aware transport honoring `retry_policy`. Caller-provided "
+            "transports must honor request timeouts."
         ),
     )
     retry_policy: RetryPolicy = Field(
@@ -101,6 +106,10 @@ class ConnectionConfigSync(BaseModel):
             "Also honored via OPENSANDBOX_DISABLE_METRICS=1."
         ),
     )
+    enable_tracing: bool = Field(
+        default=False,
+        description="Enable OpenTelemetry tracing for SDK operations.",
+    )
 
     _ENV_API_KEY = "OPEN_SANDBOX_API_KEY"
     _ENV_DOMAIN = "OPEN_SANDBOX_DOMAIN"
@@ -114,37 +123,35 @@ class ConnectionConfigSync(BaseModel):
 
         client_ip.apply_client_ip(self.headers)
 
-    def with_transport_if_missing(self) -> "ConnectionConfigSync":
-        """
-        Ensure a transport exists for this SDK resource.
-
-        When `transport` is missing, return a copy whose `transport` is
-        a retry-wrapped HTTPTransport (unless the policy has no
-        wrapper-only knobs, in which case the raw transport is used).
-        When present, return self unchanged.
-        """
+    def with_transport_if_missing(
+        self,
+        *,
+        max_connections: int | None = 100,
+        max_keepalive_connections: int = 20,
+        keepalive_expiry: float = 30.0,
+    ) -> "ConnectionConfigSync":
         if self.transport is not None:
             return self
+        ssl_context = httpx.create_ssl_context()
         inner = httpx.HTTPTransport(
+            verify=ssl_context,
             limits=httpx.Limits(
-                max_connections=100,
-                max_keepalive_connections=20,
-                keepalive_expiry=30.0,
+                max_connections=max_connections,
+                max_keepalive_connections=max_keepalive_connections,
+                keepalive_expiry=keepalive_expiry,
             ),
         )
+        bounded = DeadlineSyncTransport(inner, ssl_context)
         wrapped: httpx.BaseTransport
         if self.retry_policy.wraps_transport():
-            wrapped = RetrySyncTransport(
-                inner, self.retry_policy, owns_inner=True
-            )
+            wrapped = RetrySyncTransport(bounded, self.retry_policy, owns_inner=True)
         else:
-            wrapped = inner
+            wrapped = bounded
         config = self.model_copy(update={"transport": wrapped})
         config._owns_transport = True
         return config
 
     def close_transport_if_owned(self) -> None:
-        """Close the transport only if it was created by default_factory."""
         if self.transport is None or not self._owns_transport:
             return
         try:

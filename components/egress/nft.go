@@ -37,7 +37,7 @@ func createNftManager(mode string) nftApplier {
 	return nftables.NewManagerWithOptions(parseNftOptions())
 }
 
-// setupNft: apply static policy to nft, then wire allowed DNS answers to AddResolvedIPs (dynamic allow sets).
+// setupNft: apply static policy to nft, then wire allowed DNS answers to AddResolvedDomain (dynamic allow sets).
 // nameserverIPs and always-deny/allow follow the same merge rules as the policy API (MergeAlwaysOverlay + WithExtraAllowIPs).
 func setupNft(ctx context.Context, nftMgr nftApplier, initialPolicy *policy.NetworkPolicy, proxy *dnsproxy.Proxy, nameserverIPs []netip.Addr, alwaysDeny, alwaysAllow []policy.EgressRule) {
 	if nftMgr == nil {
@@ -63,16 +63,17 @@ func setupNft(ctx context.Context, nftMgr nftApplier, initialPolicy *policy.Netw
 	proxy.SetOnResolved(func(domain string, ips []nftables.ResolvedIP) {
 		addCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := nftMgr.AddResolvedIPs(addCtx, ips); err != nil {
-			log.Warnf("[dns] add resolved IPs to nft failed for domain %q: %v", domain, err)
+		if err := nftMgr.AddResolvedDomain(addCtx, domain, ips); err != nil {
+			log.Warnf("[dns] record resolved domain %q failed: %v", domain, err)
 		}
 	})
 	nftMgr.StartConnectionRefresh(ctx)
+	nftMgr.StartDomainRefresh(ctx, proxy.ResolveDomain)
 }
 
 // parseDoHBlocklist parses the comma-separated OPENSANDBOX_EGRESS_DOH_BLOCKLIST
 // value (IP or CIDR entries) into v4/v6 lists. Invalid entries are logged and
-// skipped. Shared by the sidecar and fleet profiles so both enforce the same
+// skipped. Shared by the sidecar and fast-sandbox profiles so both enforce the same
 // DoH-443 semantics.
 func parseDoHBlocklist(raw string) (v4, v6 []string) {
 	for _, p := range strings.Split(raw, ",") {

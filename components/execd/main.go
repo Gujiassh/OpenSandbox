@@ -67,7 +67,6 @@ func run() int {
 	flag.InitFlags()
 	log.Init(flag.ServerLogLevel)
 
-	// Load isolation config.
 	isoCfg, err := isolation.LoadConfig(flag.IsolationConfigPath)
 	if err != nil {
 		log.Error("isolation: config: %v", err)
@@ -100,7 +99,6 @@ func run() int {
 		runtime.SetEbpfState(runtime.LayerState{State: ebpfState, Message: ebpfMessage})
 	}
 
-	// Probe isolation runtime capabilities.
 	isolationProbe := isolation.Probe(isolation.ProbeConfig{
 		UpperRoot:     isoCfg.UpperRoot,
 		UpperMaxBytes: isoCfg.UpperMaxBytes,
@@ -132,13 +130,14 @@ func run() int {
 	// Always store probe result for capabilities endpoint.
 	controller.InitIsolatedProbe(&isolationProbe)
 
-	// Init isolation runner if probe succeeded.
+	var isolatedRunner *runtime.IsolatedRunner
 	if isolationProbe.Available {
 		iso := isolation.NewBwrapWithProbe(isoCfg, isolationProbe)
 		runner, err := runtime.NewIsolatedRunner(ctrl, iso, isoCfg)
 		if err != nil {
 			log.Error("isolation: runner init failed (continuing without isolation): %v", err)
 		} else {
+			isolatedRunner = runner
 			controller.InitIsolatedRunner(runner)
 			defer func() {
 				if err := closeIsolatedRunnerWithRetry(
@@ -159,11 +158,11 @@ func run() int {
 		}
 	}
 	if clone3Compat {
-		log.Warn("execd running with clone3 compatibility (seccomp returns ENOSYS for clone3)")
+		log.Warn("clone3: compatibility mode enabled (seccomp returns ENOSYS for clone3)")
 	}
 	otelShutdown, err := telemetry.Init(context.Background())
 	if err != nil {
-		log.Warn("OpenTelemetry metrics disabled (continuing without OTLP): %v", err)
+		log.Warn("otel: metrics disabled (continuing without OTLP): %v", err)
 		otelShutdown = nil
 	}
 	if otelShutdown != nil {
@@ -174,6 +173,18 @@ func run() int {
 		}()
 	}
 
+	initManager := controller.InitRuntimeInitManager(&controller.RuntimeInitConfig{
+		Ctrl:              ctrl,
+		IsolatedResetter:  isolatedRunner,
+		LaunchEntrypoint:  entryLauncher(startInitEntrypoint),
+		EntrypointArgs:    flag.Args(),
+		TemplateLifecycle: lifecycleConfig,
+		AppendStartupStatus: func(status string) error {
+			return appendLifecycleStartupStatus(flag.LifecycleStartupStatusFile, status)
+		},
+	})
+	defer initManager.StopPeriodic()
+
 	engine := web.NewRouter(flag.ServerAccessToken)
 	if err := runHTTPServer(
 		engine,
@@ -181,15 +192,25 @@ func run() int {
 		initStartupCtx,
 		stopInitStartupSignals,
 		lifecycleConfig,
+		initManager,
 	); err != nil {
 		if errors.Is(err, errStartupShutdown) {
-			log.Info("shutdown requested before user entrypoint started: %v", err)
+			log.Info("execd: shutdown requested before user entrypoint started: %v", err)
 			return 0
 		}
-		log.Error("execd server stopped with error: %v", err)
+		log.Error("execd: server stopped with error: %v", err)
 		return 1
 	}
 	return 0
+}
+
+// entryLauncher adapts a nil init-mode launcher (classic mode) into the
+// manager's optional entrypoint relauncher.
+func entryLauncher(startInitEntrypoint func([]string) error) func([]string) error {
+	if !flag.InitMode || startInitEntrypoint == nil {
+		return nil
+	}
+	return startInitEntrypoint
 }
 
 func runHTTPServer(
@@ -198,13 +219,14 @@ func runHTTPServer(
 	initStartupCtx context.Context,
 	stopInitStartupSignals context.CancelFunc,
 	lifecycleConfig *lifecycle.Config,
+	initManager *controller.RuntimeInitManager,
 ) error {
 	addr := fmt.Sprintf(":%d", flag.ServerPort)
 	listener, err := net.Listen("tcp4", addr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", addr, err)
 	}
-	log.Info("execd listening on %s (IPv4)", addr)
+	log.Info("execd: listening on %s (IPv4)", addr)
 	// In init mode SIGTERM belongs to the init lifecycle (forward + graceful
 	// shutdown with the entrypoint's exit status); only SIGINT cancels the
 	// HTTP server there.
@@ -217,13 +239,14 @@ func runHTTPServer(
 		ctxSignals...,
 	)
 	defer stopSignals()
-	var periodicManager *lifecycle.PeriodicManager
-	defer func() {
-		if periodicManager != nil {
-			periodicManager.Stop()
-		}
-	}()
 	startup := func() error {
+		if flag.RuntimeInit {
+			// Runtime-init mode: preStart and the entrypoint are applied by
+			// POST /internal/init; only the lifecycle/startup probe surface is set up
+			// here.
+			log.Info("execd: runtime-init mode: waiting for POST /internal/init before starting user workloads")
+			return nil
+		}
 		preStartCtx := serverCtx
 		if flag.InitMode {
 			preStartCtx = initStartupCtx
@@ -239,13 +262,14 @@ func runHTTPServer(
 		if startErr != nil {
 			return startErr
 		}
-		periodicManager = manager
+		initManager.SetPeriodic(manager)
 		if flag.InitMode {
 			stopInitStartupSignals()
 			if err := startInitEntrypoint(flag.Args()); err != nil {
 				return err
 			}
 		}
+		initManager.MarkReady()
 		return nil
 	}
 	return serveHTTPUntilShutdown(serverCtx, listener, engine, startup)

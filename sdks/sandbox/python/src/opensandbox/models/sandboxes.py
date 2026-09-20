@@ -787,6 +787,14 @@ class SandboxEndpoint(BaseModel):
         default_factory=dict,
         description="Headers that must be included on every request targeting this endpoint (e.g. when the server requires them for routing or auth). Empty if not required.",
     )
+    origin: str | None = Field(
+        default=None,
+        description=(
+            "Origin of the sandbox taken from the server's "
+            "OPEN-SANDBOX-ORIGIN response header (see SandboxOrigin). "
+            "None when the server does not send it."
+        ),
+    )
 
     def build_request_headers(
         self,
@@ -991,6 +999,38 @@ class SandboxState:
     @classmethod
     def values(cls) -> set[str]:
         """Returns a set of all known state values."""
+        return {
+            v for k, v in cls.__dict__.items() if k.isupper() and not k.startswith("_")
+        }
+
+
+class SandboxOrigin:
+    """Origin backing a sandbox.
+
+    The protocol defines a single origin value: ``template`` (reported by
+    the server via the ``OPEN-SANDBOX-ORIGIN`` response header, and set
+    locally when the sandbox was explicitly created from a template).
+    Anything else - including sandboxes created from an image or a snapshot
+    - carries no origin value.
+
+    Known values:
+        TEMPLATE (str): Runs on a fsb golden-image template (no sandbox-side
+            egress sidecar; egress policy goes through the lifecycle control
+            plane).
+        UNKNOWN (str): The origin could not be determined (create from an
+            image or snapshot, or an older server that does not send the
+            header).
+
+    The server may introduce new values in future versions; clients should
+    handle unknown string values gracefully.
+    """
+
+    TEMPLATE = "template"
+    UNKNOWN = "unknown"
+
+    @classmethod
+    def values(cls) -> set[str]:
+        """Returns a set of all known source values."""
         return {
             v for k, v in cls.__dict__.items() if k.isupper() and not k.startswith("_")
         }

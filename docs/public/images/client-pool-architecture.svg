@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1400" height="720" viewBox="0 0 1400 720" role="img" aria-labelledby="title desc">
   <title id="title">Client Pool Architecture</title>
-  <desc id="desc">Client pool architecture. Multiple application nodes call pool.acquire on a per-node SandboxPool instance. The pool consists of an any-node acquire path and a leader-only reconcile loop that drives a small pool of warmup workers. The shared PoolStateStore holds only sandbox IDs with expiry and a primary lock. All server-side sandboxes are created via the OpenSandbox Lifecycle API.</desc>
+  <desc id="desc">Client pool architecture. Multiple application nodes call pool.acquire on a per-node SandboxPool instance. The pool consists of an any-node acquire path and a leader-only reconcile loop that drives staged warmup work. The shared PoolStateStore holds idle sandbox IDs and expiry plus leader, sizing, TTL, and namespace-destroy coordination. All server-side sandboxes are created via the OpenSandbox Lifecycle API.</desc>
   <defs>
     <marker id="a1-arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#1e3a5f"/>
@@ -54,17 +54,17 @@
     <text x="590" y="168" class="box-title" text-anchor="middle">Acquire path</text>
     <text x="590" y="188" class="box-text" text-anchor="middle">(runs on every node)</text>
     <text x="590" y="216" class="box-text" text-anchor="middle">pop idle ID → connect → renew</text>
-    <text x="590" y="236" class="box-text" text-anchor="middle">policy = FAIL_FAST | DIRECT_CREATE</text>
+    <text x="590" y="236" class="box-text" text-anchor="middle">fail | create | retry | retry + create</text>
 
     <rect x="430" y="290" width="320" height="120" fill="#ffffff" stroke="#6d28d9" stroke-width="1.5" rx="6"/>
     <text x="590" y="318" class="box-title" text-anchor="middle">Reconcile loop</text>
     <text x="590" y="338" class="box-text" text-anchor="middle">(leader-only replenish / shrink)</text>
-    <text x="590" y="366" class="box-text" text-anchor="middle">configured (Py/Go); fixed 1s (Kotlin)</text>
+    <text x="590" y="366" class="box-text" text-anchor="middle">nominal 1s (Py/JS/JVM); configurable Go</text>
     <text x="590" y="386" class="box-text" text-anchor="middle">acquire lock → compute gap → dispatch</text>
 
     <rect x="430" y="440" width="320" height="120" fill="#ffffff" stroke="#6d28d9" stroke-width="1.5" rx="6"/>
     <text x="590" y="468" class="box-title" text-anchor="middle">Warmup workers</text>
-    <text x="590" y="488" class="box-text" text-anchor="middle">Kotlin: staged concurrency</text>
+    <text x="590" y="488" class="box-text" text-anchor="middle">Py / JS / JVM: staged concurrency</text>
     <text x="590" y="516" class="box-text" text-anchor="middle">create → ready → prepare → validate</text>
     <text x="590" y="536" class="box-text" text-anchor="middle">→ push id into idle buffer</text>
   </g>
@@ -79,14 +79,14 @@
     <text x="1010" y="196" class="box-text" text-anchor="middle">[sandbox_id, expiry]</text>
     <text x="1010" y="216" class="box-text" text-anchor="middle">[sandbox_id, expiry]</text>
     <text x="1010" y="236" class="box-text" text-anchor="middle">[sandbox_id, expiry]</text>
-    <text x="1010" y="266" class="box-text" text-anchor="middle" font-style="italic">only IDs + expiry</text>
+    <text x="1010" y="266" class="box-text" text-anchor="middle" font-style="italic">idle membership: IDs + expiry</text>
     <text x="1010" y="286" class="box-text" text-anchor="middle" font-style="italic">no HTTP connections</text>
     <text x="1010" y="306" class="box-text" text-anchor="middle" font-style="italic">no SDK client objects</text>
 
     <rect x="890" y="345" width="240" height="80" fill="#ffffff" stroke="#c2410c" stroke-width="1.5" rx="6"/>
-    <text x="1010" y="373" class="box-title" text-anchor="middle">Primary lock</text>
-    <text x="1010" y="395" class="box-text" text-anchor="middle">owner_id + TTL</text>
-    <text x="1010" y="415" class="box-text" text-anchor="middle">default 60s</text>
+    <text x="1010" y="373" class="box-title" text-anchor="middle">Shared coordination</text>
+    <text x="1010" y="395" class="box-text" text-anchor="middle">primary lock / max idle / TTL</text>
+    <text x="1010" y="415" class="box-text" text-anchor="middle">destroy fence + tombstone</text>
   </g>
 
   <!-- Lifecycle API -->
@@ -127,5 +127,5 @@
   <text x="770" y="455" class="edge-label" text-anchor="middle">connect / renew</text>
 
   <text x="700" y="620" class="caption" text-anchor="middle">Acquire runs on every node; reconcile only runs on the node that holds the primary lock.</text>
-  <text x="700" y="642" class="caption" text-anchor="middle">The store holds only IDs + expiry, so switching to Redis makes the pool truly shared across processes / pods.</text>
+  <text x="700" y="642" class="caption" text-anchor="middle">Redis shares idle membership and coordination across processes / pods; SDK objects and HTTP connections stay local.</text>
 </svg>

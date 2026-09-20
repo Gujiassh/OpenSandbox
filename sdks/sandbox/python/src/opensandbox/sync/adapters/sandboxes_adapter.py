@@ -32,8 +32,13 @@ from opensandbox.adapters.converter.response_handler import (
 from opensandbox.adapters.converter.sandbox_model_converter import (
     SandboxModelConverter,
 )
+from opensandbox.adapters.converter.template_model_converter import (
+    TemplateModelConverter,
+)
+from opensandbox.adapters.sandboxes_adapter import encode_metadata_filter
 from opensandbox.api.lifecycle.types import UNSET
 from opensandbox.config.connection_sync import ConnectionConfigSync
+from opensandbox.internal.readiness import constrain_readiness_request
 from opensandbox.models.sandboxes import (
     CreateSnapshotRequest,
     CredentialProxyConfig,
@@ -51,6 +56,12 @@ from opensandbox.models.sandboxes import (
     SnapshotFilter,
     SnapshotInfo,
     Volume,
+)
+from opensandbox.models.templates import (
+    CreateTemplateRequest,
+    PagedTemplateInfos,
+    TemplateFilter,
+    TemplateInfo,
 )
 from opensandbox.sync.services.sandbox import SandboxesSync
 
@@ -93,6 +104,7 @@ class SandboxesAdapterSync(SandboxesSync):
         )
 
         self._httpx_client = httpx.Client(
+            event_hooks={"request": [constrain_readiness_request]},
             base_url=self.connection_config.get_base_url(),
             headers=headers,
             timeout=timeout,
@@ -162,6 +174,42 @@ class SandboxesAdapterSync(SandboxesSync):
             )
             raise ExceptionConverter.to_sandbox_exception(e) from e
 
+    def create_sandbox_from_template(
+        self,
+        template_id: str,
+        timeout: timedelta,
+        metadata: dict[str, str] | None = None,
+        network_policy: NetworkPolicy | None = None,
+        extensions: dict[str, str] | None = None,
+    ) -> SandboxCreateResponse:
+        try:
+            from opensandbox.api.lifecycle.api.sandboxes import post_sandboxes
+            from opensandbox.api.lifecycle.models import (
+                CreateSandboxResponse as ApiCreateSandboxResponse,
+            )
+
+            create_request = SandboxModelConverter.to_api_create_template_sandbox_request(
+                template_id=template_id,
+                timeout=timeout,
+                metadata=metadata,
+                network_policy=network_policy,
+                extensions=extensions,
+            )
+            response_obj = post_sandboxes.sync_detailed(
+                client=self._get_client(), body=create_request
+            )
+            handle_api_error(
+                response_obj, f"Create sandbox from template {template_id}"
+            )
+
+            parsed = require_parsed(
+                response_obj, ApiCreateSandboxResponse, "Create sandbox from template"
+            )
+            return SandboxModelConverter.to_sandbox_create_response(parsed)
+        except Exception as e:
+            logger.warning(f"Failed to create sandbox from template {template_id}: {e}")
+            raise ExceptionConverter.to_sandbox_exception(e) from e
+
     def get_sandbox_info(self, sandbox_id: str) -> SandboxInfo:
         try:
             from opensandbox.api.lifecycle.api.sandboxes import get_sandboxes_sandbox_id
@@ -181,19 +229,9 @@ class SandboxesAdapterSync(SandboxesSync):
             raise ExceptionConverter.to_sandbox_exception(e) from e
 
     def list_sandboxes(self, filter: SandboxFilter) -> PagedSandboxInfos:
-        # metadata double-encoding logic kept identical to async adapter
-        metadata = UNSET
-        if filter.metadata:
-            from urllib.parse import quote
-
-            metadata_parts: list[str] = []
-            for key, value in filter.metadata.items():
-                k1 = quote(key, safe="")
-                v1 = quote(value, safe="")
-                k2 = quote(k1, safe="")
-                v2 = quote(v1, safe="")
-                metadata_parts.append(f"{k2}={v2}")
-            metadata = "&".join(metadata_parts)
+        metadata = (
+            encode_metadata_filter(filter.metadata) if filter.metadata else UNSET
+        )
 
         try:
             from opensandbox.api.lifecycle.api.sandboxes import get_sandboxes
@@ -278,12 +316,23 @@ class SandboxesAdapterSync(SandboxesSync):
                 response_obj, f"Get endpoint for sandbox {sandbox_id} port {port}"
             )
             parsed = require_parsed(response_obj, ApiEndpoint, "Get endpoint")
-            return SandboxModelConverter.to_sandbox_endpoint(parsed)
+            return SandboxModelConverter.to_sandbox_endpoint(
+                parsed, origin=self._sandbox_origin(response_obj)
+            )
         except Exception as e:
             logger.warning(
                 f"Failed to retrieve sandbox endpoint for sandbox {sandbox_id}: {e}"
             )
             raise ExceptionConverter.to_sandbox_exception(e) from e
+
+    @staticmethod
+    def _sandbox_origin(response_obj: object) -> str | None:
+        """Extract the OPEN-SANDBOX-ORIGIN response header when present."""
+        headers = getattr(response_obj, "headers", None)
+        if headers is None:
+            return None
+        value = headers.get("OPEN-SANDBOX-ORIGIN")
+        return value or None
 
     def invalidate_endpoint_cache(self, sandbox_id: str) -> None:
         """Remove all cached endpoints for a sandbox."""
@@ -315,7 +364,9 @@ class SandboxesAdapterSync(SandboxesSync):
                 f"Get signed endpoint for sandbox {sandbox_id} port {port}",
             )
             parsed = require_parsed(response_obj, ApiEndpoint, "Get signed endpoint")
-            return SandboxModelConverter.to_sandbox_endpoint(parsed)
+            return SandboxModelConverter.to_sandbox_endpoint(
+                parsed, origin=self._sandbox_origin(response_obj)
+            )
         except Exception as e:
             logger.debug(
                 f"Failed to retrieve signed sandbox endpoint for sandbox {sandbox_id}",
@@ -478,4 +529,80 @@ class SandboxesAdapterSync(SandboxesSync):
             handle_api_error(response_obj, f"Delete snapshot {snapshot_id}")
         except Exception as e:
             logger.warning(f"Failed to delete snapshot {snapshot_id}: {e}")
+            raise ExceptionConverter.to_sandbox_exception(e) from e
+
+    def create_template(self, request: CreateTemplateRequest) -> TemplateInfo:
+        try:
+            from opensandbox.api.lifecycle.api.templates import create_template
+            from opensandbox.api.lifecycle.models import FsbTemplate as ApiTemplate
+
+            response_obj = create_template.sync_detailed(
+                client=self._get_client(),
+                body=TemplateModelConverter.to_api_create_template_request(request),
+            )
+            handle_api_error(response_obj, "Create template")
+            parsed = require_parsed(response_obj, ApiTemplate, "Create template")
+            return TemplateModelConverter.to_template_info(parsed)
+        except Exception as e:
+            logger.warning(f"Failed to create template: {e}")
+            raise ExceptionConverter.to_sandbox_exception(e) from e
+
+    def get_template(self, template_id: str) -> TemplateInfo:
+        try:
+            from opensandbox.api.lifecycle.api.templates import get_template
+            from opensandbox.api.lifecycle.models import FsbTemplate as ApiTemplate
+
+            response_obj = get_template.sync_detailed(
+                client=self._get_client(),
+                template_id=template_id,
+            )
+            handle_api_error(response_obj, f"Get template {template_id}")
+            parsed = require_parsed(
+                response_obj, ApiTemplate, f"Get template {template_id}"
+            )
+            return TemplateModelConverter.to_template_info(parsed)
+        except Exception as e:
+            logger.warning(f"Failed to get template {template_id}: {e}")
+            raise ExceptionConverter.to_sandbox_exception(e) from e
+
+    def list_templates(self, filter: TemplateFilter) -> PagedTemplateInfos:
+        metadata = (
+            encode_metadata_filter(filter.metadata) if filter.metadata else UNSET
+        )
+
+        try:
+            from opensandbox.api.lifecycle.api.templates import list_templates
+            from opensandbox.api.lifecycle.models import (
+                ListFsbTemplatesResponse as ApiListTemplatesResponse,
+            )
+            from opensandbox.api.lifecycle.types import UNSET as API_UNSET
+
+            response_obj = list_templates.sync_detailed(
+                client=self._get_client(),
+                metadata=metadata,
+                page=filter.page if filter.page is not None else API_UNSET,
+                page_size=filter.page_size
+                if filter.page_size is not None
+                else API_UNSET,
+            )
+            handle_api_error(response_obj, "List templates")
+            parsed = require_parsed(
+                response_obj, ApiListTemplatesResponse, "List templates"
+            )
+            return TemplateModelConverter.to_paged_template_infos(parsed)
+        except Exception as e:
+            logger.warning(f"Failed to list templates: {e}")
+            raise ExceptionConverter.to_sandbox_exception(e) from e
+
+    def delete_template(self, template_id: str) -> None:
+        try:
+            from opensandbox.api.lifecycle.api.templates import delete_template
+
+            response_obj = delete_template.sync_detailed(
+                client=self._get_client(),
+                template_id=template_id,
+            )
+            handle_api_error(response_obj, f"Delete template {template_id}")
+        except Exception as e:
+            logger.warning(f"Failed to delete template {template_id}: {e}")
             raise ExceptionConverter.to_sandbox_exception(e) from e

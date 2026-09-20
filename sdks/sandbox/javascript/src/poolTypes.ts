@@ -30,9 +30,21 @@ export enum PoolLifecycleState {
   STOPPED = "STOPPED",
 }
 
-export enum PoolHealthState {
+export enum PoolState {
   HEALTHY = "HEALTHY",
   DEGRADED = "DEGRADED",
+  DRAINING = "DRAINING",
+  STOPPED = "STOPPED",
+}
+
+export enum PoolDestroyState {
+  ACTIVE = "ACTIVE",
+  DESTROYING = "DESTROYING",
+  DESTROYED = "DESTROYED",
+}
+
+export enum PoolDestroyStrategy {
+  FORCE = "FORCE",
 }
 
 export interface IdleEntry {
@@ -77,14 +89,18 @@ export interface PoolStateStore {
   ): Promise<ReapResult>;
   snapshotCounters(poolName: string): Promise<StoreCounters>;
   snapshotIdleEntries(poolName: string): Promise<IdleEntry[]>;
-  getMaxIdle(poolName: string): Promise<number>;
+  getMaxIdle(poolName: string): Promise<number | undefined>;
   setMaxIdle(poolName: string, maxIdle: number): Promise<void>;
   setIdleEntryTtl(poolName: string, ttlSeconds: number): Promise<void>;
+  getDestroyState(poolName: string): Promise<PoolDestroyState>;
+  beginDestroy(poolName: string, ownerId: string): Promise<void>;
+  clearPoolState(poolName: string): Promise<void>;
+  markDestroyed(poolName: string, ownerId: string, tombstoneTtlSeconds?: number | null): Promise<void>;
 }
 
 export interface PoolSnapshot {
+  state: PoolState;
   lifecycleState: PoolLifecycleState;
-  healthState: PoolHealthState;
   idleCount: number;
   maxIdle: number;
   failureCount: number;
@@ -117,7 +133,9 @@ export interface PooledSandboxCreateContext {
   readyTimeoutSeconds: number;
   healthCheckPollingIntervalMillis: number;
   skipHealthCheck: boolean;
+  healthCheck?: PoolHealthCheck;
   connectionConfig: ConnectionConfig;
+  createConnectionConfig: ConnectionConfig;
   creationSpec: PoolCreationSpec;
   signal?: AbortSignal;
 }
@@ -140,22 +158,26 @@ export interface SandboxPoolOptions {
   sandboxCreator?: PooledSandboxCreator;
   stateStore?: PoolStateStore;
   ownerId?: string;
+  warmupCreateQps?: number;
   warmupConcurrency?: number;
   primaryLockTtlSeconds?: number;
-  reconcileIntervalSeconds?: number;
   degradedThreshold?: number;
-  emptyBehavior?: AcquirePolicy;
   idleTimeoutSeconds?: number;
   drainTimeoutSeconds?: number;
   acquireMinRemainingTtlSeconds?: number;
   acquireReadyTimeoutSeconds?: number;
   acquireHealthCheckPollingIntervalMillis?: number;
   acquireHealthCheck?: PoolHealthCheck;
+  acquireSkipHealthCheck?: boolean;
   maxAcquireRetries?: number;
   warmupReadyTimeoutSeconds?: number;
+  warmupHealthCheckInitialDelayMillis?: number;
   warmupHealthCheckPollingIntervalMillis?: number;
   warmupHealthCheck?: PoolHealthCheck;
-  warmupPreparer?: PoolSandboxPreparer;
+  warmupSandboxPreparer?: PoolSandboxPreparer;
+  warmupPostPrepareHealthCheck?: PoolHealthCheck;
+  warmupPostPrepareHealthCheckTimeoutSeconds?: number;
+  warmupSkipHealthCheck?: boolean;
   logger?: PoolLogger;
 }
 
@@ -165,4 +187,18 @@ export interface SandboxAcquireOptions {
   minRemainingTtlSeconds?: number;
   skipHealthCheck?: boolean;
   signal?: AbortSignal;
+}
+
+export interface PoolDestroyOptions {
+  strategy?: PoolDestroyStrategy;
+  drainTimeoutSeconds?: number;
+  tombstoneTtlSeconds?: number | null;
+}
+
+export interface PoolDestroyResult {
+  poolName: string;
+  state: PoolDestroyState;
+  drainedIdleCount: number;
+  killedIdleCount: number;
+  persistentStateCleared: boolean;
 }

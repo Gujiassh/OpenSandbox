@@ -13,7 +13,7 @@
 // limitations under the License.
 import { defineConfig } from "tsup";
 
-const entries = ["src/index.ts", "src/internal.ts"];
+const entries = ["src/index.ts", "src/internal.ts", "src/poolRedis.ts"];
 
 export default defineConfig([
   {

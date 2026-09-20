@@ -1,244 +1,157 @@
 ---
 title: Release Automation
-description: Tag-driven release workflow for OpenSandbox SDKs, CLI, server, Docker images, and Helm charts.
+description: How OpenSandbox releases work — one umbrella release, one tag, every artifact.
 ---
 
 # Release Automation
 
-This repository uses tag-driven publish workflows. The script below standardizes:
+OpenSandbox ships as a **unified umbrella release** (OSEP-0016): every
+artifact of a release — platform images, Helm charts (in-repo), CLI, and
+all SDKs — carries the same `X.Y.Z`, driven by a single workflow.
+Per-component and per-SDK release entry points have been removed; the
+umbrella is the only release path. See
+[Versioning](/community/versioning) for naming and cadence.
 
-- canonical tag creation for each release target
-- release note generation from previous release to current commit
-- GitHub Release create/update
-- signed source archive upload and provenance attestation in the Generic
-  Release workflow
-
-Script path:
-
-- `scripts/release/create-release.sh`
-
-## Supported Targets
-
-- `js/sandbox`
-- `js/code-interpreter`
-- `python/sandbox`
-- `python/code-interpreter`
-- `python/mcp/sandbox`
-- `java/sandbox`
-- `csharp/sandbox`
-- `csharp/code-interpreter`
-- `sdks/sandbox/go`
-- `cli`
-- `server`
-- `docker/execd`
-- `docker/nodeagent`
-- `docker/code-interpreter`
-- `docker/ingress`
-- `docker/egress`
-- `k8s/controller`
-- `k8s/task-executor`
-- `helm/opensandbox`
-- `helm/opensandbox-node-agent`
-- `helm` (alias of `helm/opensandbox`)
-
-The `java/sandbox` target publishes the Kotlin/JVM SDK release train, including
-`sandbox`, `sandbox-api`, `sandbox-pool-redis`, `code-interpreter`, and
-`sandbox-bom`.
-
-## Tag Rules
-
-The script aligns with existing workflow triggers:
-
-- v-prefixed tags:
-  - `<target>/v<version>` for SDK/CLI/Server targets
-  - examples: `js/sandbox/v1.0.5`, `server/v0.2.0`
-  - Go SDK example: `sdks/sandbox/go/v1.0.0`
-- plain suffix tags:
-  - `<target>/<version>` for docker/k8s/helm targets
-  - examples: `docker/execd/v0.3.0`, `helm/opensandbox/0.1.0`
-
-Release tag namespaces are protected by repository rulesets. Only authorized
-release managers may create matching tags, and an existing release tag cannot
-be updated or deleted.
-
-## Release Approval and Source Verification
-
-Hosted publish workflows run a shared release preflight before publishing:
-
-- the release commit must be reachable from `origin/main`
-- non-dry-run releases require approval through the `release` environment
-- the person who triggered the release cannot approve their own deployment
-
-This implements two-person control: one person initiates the release and a
-different Project Maintainer approves it. GitHub environments require one of
-the configured reviewers; they do not natively support requiring two reviewer
-approvals in addition to the initiator.
-
-The hosted Generic Release workflow does not create or push release tags. An
-authorized release manager must create the tag from a commit on `main` before
-running a non-dry-run Generic Release.
-
-## Release Notes Format
-
-Generated notes follow this section structure:
-
-- `## What's New`
-- `### ✨ Features`
-- `### 🐛 Bug Fixes`
-- `### ⚠️ Breaking Changes`
-- `### 📦 Misc`
-- `## 👥 Contributors`
-
-Commit categorization:
-
-- `feat:` -> Features
-- `fix:` -> Bug Fixes
-- `BREAKING CHANGE` or `type!:` -> Breaking Changes
-- everything else -> Misc
-
-## Usage
+## Release Preparation (manual, on the release branch)
 
 ```bash
-scripts/release/create-release.sh --target <target> --version <version> [options]
+# 1. one-command bump: chart versions, image references, SDK versions,
+#    and dependency ranges rewritten to the target version in one commit
+manifests/release/create-umbrella-release.sh --version 1.1.0 --bump-only
+
+# 2. hand-author the release notes (copy docs/releases/TEMPLATE.md),
+#    then push
+cp docs/releases/TEMPLATE.md docs/releases/1.1.0.md
+$EDITOR docs/releases/1.1.0.md
+git push
 ```
 
-Required:
+## Prereleases (rc)
 
-- `--target`
-- `--version`
-
-Options:
-
-- `--from-tag <tag>`: explicit previous release boundary
-- `--path <path>`: append custom path filter (repeatable)
-- `--no-path-filter`: disable default target path scope and use whole range
-- `--initial-release`: allow no previous tag; use full history
-- `--dry-run`: render computed tag/range/notes without side effects
-- `--push`: push created tag to origin
-- `--sign-tag`: create a cryptographically signed git tag using the local git
-  signing configuration. This is intended for local release-operator use, not
-  the hosted GitHub Actions release workflow.
-
-## Path Filtering Strategy
-
-By default, each target only includes commits from target-related paths to reduce noise.
-
-Examples:
-
-- `js/sandbox` -> `sdks/sandbox/javascript` + `specs/sandbox-lifecycle.yml`
-- `server` -> `server` + `specs/sandbox-lifecycle.yml`
-- `docker/egress` -> `components/egress`
-- `docker/nodeagent` -> `components/nodeagent` + `components/internal`
-- `helm/opensandbox` -> `kubernetes/charts/opensandbox`
-- `helm/opensandbox-node-agent` -> `kubernetes/charts/opensandbox-node-agent`
-
-Override behavior:
-
-- Add extra scope with `--path`:
-  - `--path docs/` or `--path specs/execd-api.yaml`
-- Disable default scope with `--no-path-filter`:
-  - falls back to the entire commit range (`from..HEAD`)
-
-## Common Examples
-
-Dry-run JavaScript SDK release:
+An rc is always cut on the **line-birth version** (`X.Y.0-rc.N` — there
+is no `X.Y.Z-rc` for `Z > 0`). It validates that the platform deploys
+and the fan-out runs: images are published, **all packages are held
+(not published)**, and only the umbrella tag is minted (marked
+`--prerelease` on GitHub). rc runs are approval-free: no `release`
+environment gate, and the BOM PR merges without waiting for review (if
+the release-branch ruleset still mandates review, add a ruleset bypass
+for the release bot — the workflow fails fast instead of waiting).
 
 ```bash
-scripts/release/create-release.sh --target js/sandbox --version 1.0.5 --dry-run
+# 1. bump (channel=rc is derived from the suffix)
+manifests/release/create-umbrella-release.sh --version 1.1.0-rc.1 --bump-only
+
+# 2. notes, then push
+cp docs/releases/TEMPLATE.md docs/releases/1.1.0-rc.1.md
+$EDITOR docs/releases/1.1.0-rc.1.md
+git push
+
+# 3. dispatch
+gh workflow run release-umbrella.yml \
+  --ref release-1.1 \
+  -f version=1.1.0-rc.1 -f dry_run=false
 ```
 
-Dry-run server release:
+Repeat with `-rc.2`, `-rc.3`, … as fixes land — every rc is a full
+rebuild and previous rc artifacts stay frozen in the registries. The
+stable release of the line (`1.1.0`, no suffix) then publishes packages
+for real. Prereleases are never resolved by default (PyPI / NuGet /
+Maven / Go hide them; npm publishes under the `rc` dist-tag).
 
-```bash
-scripts/release/create-release.sh --target server --version 0.2.0 --dry-run
-```
+## Release Execution (workflow)
 
-Dry-run JavaScript SDK release with additional docs scope:
+Dispatch `.github/workflows/release-umbrella.yml`
+(`dry_run=false`, `version`, `channel`, `release_branch`). Stable
+releases require a release approver other than the triggerer to approve
+the `release` environment; rc releases and dry runs run approval-free.
+The workflow then runs:
 
-```bash
-scripts/release/create-release.sh --target js/sandbox --version 1.0.5 --dry-run --path docs/
-```
+| Stage | What happens |
+|---|---|
+| preflight | commit reachability + notes presence (`docs/releases/<version>.md`) |
+| scan | version-consistency scan (release-blocking) |
+| build | 13 images built and pushed directly to `release-X.Y.Z` (run-scoped staging tags while the `UMBRELLA_PUBLISH_ENABLED` gate is closed); all packages built and held |
+| BOM | digests pinned into `docs/releases/<version>.yaml`, pushed to a `release/<version>` branch; the workflow opens a PR to the release branch and merges it (`C_bom`) — stable waits for a code-owner approval (required by the branch ruleset), rc merges immediately |
+| publish | once the BOM PR merges (all images green + code-owner approval), packages publish in verify-then-continue order (PyPI → npm → NuGet → Maven Central last); images are already public at `release-X.Y.Z` from the build stage |
+| tag | `release-X.Y.Z` + `sdks/sandbox/go/vX.Y.Z` minted on `C_bom`, GitHub Release created with the notes and BOM |
 
-Dry-run JavaScript SDK release without path filtering (full range):
+A failed release never mints its git tag or GitHub Release, so the
+release feed never shows a partial release; the weekly scheduled
+dry-run (`dry_run=true`) keeps the fan-out healthy
+between release windows.
 
-```bash
-scripts/release/create-release.sh --target js/sandbox --version 1.0.5 --dry-run --no-path-filter
-```
+### Dry runs
 
-Server release with tag push:
+`dry_run=true` exercises everything except publishing: images are built
+**locally** (single-arch, `--load` — no registry push, no credentials
+needed), packages are built and held as workflow artifacts, the BOM
+lands on the release branch through the BOM PR (one code-owner
+approval, as on any change to a protected branch) with local image
+IDs standing in for registry digests, and no git tags are minted. To
+rehearse a release in a fork, prepare the release branch (bump + notes)
+and dispatch the workflow with `dry_run=true` — the
+`UMBRELLA_PUBLISH_ENABLED` variable does not need to exist there. The
+fork must enable **Allow GitHub Actions to create and approve pull
+requests** (Settings → Actions → General → Workflow permissions);
+`pull-requests: write` in the workflow alone cannot override that
+setting being off.
 
-```bash
-scripts/release/create-release.sh --target server --version 0.2.0 --push
-```
+## Release Artifacts
 
-Component image release:
+- `docs/releases/<version>.yaml` — BOM, authoritative for image digests
+- `docs/releases/<version>.md` — hand-authored release notes (mirrored
+  to the GitHub Release)
+- container images: `opensandbox/<component>:release-X.Y.Z` on Docker
+  Hub, GHCR, and ACR
+- packages: PyPI (server, CLI, 3 SDKs), npm (2), Maven Central (5
+  Kotlin/JVM coordinates), NuGet (2) — all at the umbrella version
+- Helm charts: **not published**; they ship in-repo at the release tag
 
-```bash
-scripts/release/create-release.sh --target docker/execd --version v0.3.0 --push
-```
+## Release Runbook
 
-Helm chart release:
+### Publish order and rollback
 
-```bash
-scripts/release/create-release.sh --target helm/opensandbox --version 0.1.0 --push
-```
+Packages publish in verify-then-continue order — each leg is externally
+verified before the next starts. Maven Central runs **last** because a
+released Maven version is immutable: ordering it last means every
+reversible ecosystem is already verified before the irreversible step.
+On a failure, remediate already-published legs in reverse order:
 
-## Dry-Run Output Example
+| Ecosystem | Revocation |
+|---|---|
+| Maven Central | not released if its leg failed; after release, immutable — deprecate only |
+| NuGet | `dotnet nuget delete <pkg> <version>` (72 h), else unlist |
+| npm | `npm unpublish <pkg>@<version>` (72 h), else `npm deprecate` |
+| PyPI | manual yank via project settings (no scriptable API) |
+| images | `crane delete <image>:release-X.Y.Z` |
 
-Example output format for `--dry-run`:
+Always file a P0 release incident with the run link before remediating.
+Global mirror caches may retain revoked artifacts; revocation is
+authoritative upstream only.
 
-```text
-[release] Target: js/sandbox
-[release] Workflow: .github/workflows/publish-js-sdks.yml
-[release] New tag: js/sandbox/v1.0.5
-[release] Previous tag: js/sandbox/v0.1.4
-[release] Path filters: sdks/sandbox/javascript specs/sandbox-lifecycle.yml
-[release] Dry run enabled. No tag/release side effects will be performed.
-[release] Computed range: js/sandbox/v0.1.4..HEAD
+### N-1 emergency backport (CVSS ≥ 8.0, ≤ 72 h, one-shot per line)
 
-[release] Generated release notes preview:
-------------------------------------------------------------
-# JavaScript Sandbox SDK v1.0.5
-## What's New
-Changes included since `js/sandbox/v0.1.4`.
-Scoped paths: `sdks/sandbox/javascript specs/sandbox-lifecycle.yml`.
+1. Land the fix on `main` (standard PR review).
+2. `git checkout release-X.(Y-1) && git cherry-pick <sha> && git push`.
+3. Dispatch `release-umbrella.yml` with `version=X.(Y-1).Z`,
+   `release_branch=release-X.(Y-1)`, `dry_run=false`. The full fan-out
+   reruns; the release notes must link the CVE and name the equivalent
+   current-line snapshot.
 
-### ✨ Features
-- feat(sdks/js): support run_in_session
+Anything that is not a qualifying CVE waits for the next line birth.
 
-### 🐛 Bug Fixes
-- fix(lifecycle): harden sdk compatibility and e2e stability
+### Staging cleanup
 
-### ⚠️ Breaking Changes
-- None
+Run-scoped staging image tags (`staging-<sha>-<runid>`) exist only when
+a run does not publish release tags (dry runs, or real runs while the
+`UMBRELLA_PUBLISH_ENABLED` gate is still closed). They are namespaced
+and never referenced by user-facing surfaces; a scheduled job deletes
+staging tags whose run did not complete within 14 days. Held package
+artifacts use the default 14-day workflow-artifact retention.
 
-### 📦 Misc
-- chore(sdks): rebuild source code
-------------------------------------------------------------
-```
+## Legacy Releases
 
-If `--dry-run` is enabled, the script never creates/pushes tags and never creates/updates GitHub Releases.
-
-## Safety Defaults
-
-- The script creates/updates GitHub Release only when not in `--dry-run`.
-- Tag push is opt-in (`--push`), preventing accidental workflow trigger.
-- Tag signing is opt-in (`--sign-tag`) because it requires release-operator git
-  signing keys. The hosted GitHub Actions release workflow does not expose this
-  option. Official release artifacts are still signed by the GitHub release
-  workflows through Sigstore/GitHub attestations.
-- If previous tag cannot be found, script fails unless `--from-tag` or `--initial-release` is provided.
-
-## GitHub Actions Entry
-
-The GitHub Actions dispatch entry for this flow (`release-generic.yml`) was
-removed because it had no callers; the release process uses tag pushes that
-trigger the `publish-*` workflows directly. Run `scripts/release/create-release.sh`
-locally to create release tags and GitHub Releases:
-
-When `dry_run=false`, `scripts/release/create-release.sh` creates the tag and
-the GitHub Release. Source archives (`opensandbox-<tag>.tar.gz` + `SHA256SUMS`)
-were previously uploaded by the removed `release-generic.yml` workflow; releases
-created after its removal no longer carry source archives. See
-[Release Verification](release-verification.md) for user verification commands
-and release signing coverage.
+Historical per-component tags (`server/v0.2.3`, `docker/execd/v1.1.0`,
+…) are frozen and keep resolving forever. Verification instructions for
+those older artifacts (and their workflow identities) are in
+[Release Verification](/community/release-verification).

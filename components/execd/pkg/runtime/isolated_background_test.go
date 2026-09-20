@@ -26,6 +26,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func waitForBackgroundRun(
@@ -260,8 +262,6 @@ func TestBackgroundRun_BlocksIdleGC(t *testing.T) {
 	}
 }
 
-// Deleting a session with an in-flight background run reaps the run and
-// removes its records.
 func TestDeleteSessionWithActiveBackgroundRun(t *testing.T) {
 	runner := newTestRunner(t)
 	id := newBackgroundTestSession(t, runner, "rw")
@@ -386,7 +386,6 @@ func TestSeekIsolatedBackgroundOutput_CapsReadSize(t *testing.T) {
 		t.Errorf("cursor = %d, want %d", cursor, maxBackgroundLogReadBytes)
 	}
 
-	// The remainder is served on the next poll.
 	data2, cursor2, err := runner.SeekIsolatedBackgroundOutput(run.SessionID, run.ID, cursor)
 	if err != nil {
 		t.Fatalf("SeekIsolatedBackgroundOutput (remainder): %v", err)
@@ -428,7 +427,6 @@ func TestDeleteSessionRemovesRWRunArtifacts(t *testing.T) {
 		t.Fatalf("DeleteIsolatedSession: %v", err)
 	}
 
-	// Run files and the now-empty execd-managed dirs are gone.
 	if _, err := os.Stat(filepath.Join(runDir, runID+".log")); !os.IsNotExist(err) {
 		t.Errorf("run log should be removed after delete, stat err = %v", err)
 	}
@@ -506,7 +504,6 @@ func TestSessionDeathPreservesRunRecordUntilDelete(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	// The record survives until the session is deleted, then it is swept.
 	if err := runner.DeleteIsolatedSession(id); err != nil {
 		t.Fatalf("DeleteIsolatedSession: %v", err)
 	}
@@ -544,7 +541,6 @@ func TestDeleteKeepsUserExecdFile(t *testing.T) {
 		t.Fatalf("DeleteIsolatedSession: %v", err)
 	}
 
-	// The user's file must survive; the fallback run log is gone.
 	data, err := os.ReadFile(filepath.Join(ws, ".execd"))
 	if err != nil {
 		t.Fatalf("user .execd file was removed: %v", err)
@@ -596,13 +592,11 @@ func TestBackgroundRunLogCappedOnDisk(t *testing.T) {
 		t.Fatal("run record missing")
 	}
 	run := v.(*IsolatedBackgroundRun)
-	info, err := os.Stat(run.logPath)
-	if err != nil {
-		t.Fatalf("stat log: %v", err)
-	}
-	if info.Size() != maxBackgroundLogReadBytes {
-		t.Errorf("log size = %d, want %d (capped)", info.Size(), maxBackgroundLogReadBytes)
-	}
+	// The completion flag is published before the monitor caps the log.
+	require.Eventually(t, func() bool {
+		info, err := os.Stat(run.logPath)
+		return err == nil && info.Size() == maxBackgroundLogReadBytes
+	}, 5*time.Second, 10*time.Millisecond, "completed run log should be capped")
 }
 
 // TestSeekIsolatedBackgroundOutput_ClampsCursorPastEOF verifies a cursor beyond
@@ -639,7 +633,6 @@ func TestSeekIsolatedBackgroundOutput_ClampsCursorPastEOF(t *testing.T) {
 		t.Errorf("cursor = %d, want 5 (clamped to the end of the log)", cursor)
 	}
 
-	// New output written after the overshooting poll must still be readable.
 	if err := os.WriteFile(logPath, []byte("hello world"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -758,7 +751,6 @@ func TestBackgroundRunCompletesDespiteShellSyntaxError(t *testing.T) {
 		t.Errorf("ExitCode = %v, want non-zero (syntax error)", snapshot.ExitCode)
 	}
 
-	// The session shell must still be usable after the broken code.
 	if err := runner.RunInIsolatedSession(context.Background(), id, "echo still-alive", nil, nil); err != nil {
 		t.Errorf("foreground run after broken background code: %v", err)
 	}
@@ -807,7 +799,6 @@ func TestBackgroundRunCompletesAfterRunDirDeleted(t *testing.T) {
 		t.Errorf("ExitCode = %v, want 0", snapshot.ExitCode)
 	}
 
-	// The completion marker was written to the workspace-root fallback.
 	if _, err := os.Stat(filepath.Join(ws, runID+".code")); err != nil {
 		t.Errorf("fallback exit-code file should exist, stat err = %v", err)
 	}

@@ -21,12 +21,15 @@ so the root ``cli`` callback creates our mock instead of a real SDK client.
 from __future__ import annotations
 
 import json
+import os
+import stat
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
+from opensandbox.exceptions import SandboxApiException
 from opensandbox.models.diagnostics import DiagnosticContent
 from opensandbox.models.sandboxes import SandboxImageSpec
 
@@ -835,6 +838,244 @@ class TestFileTransfer:
         assert local_path.read_bytes() == b"hello"
         mock_sb.files.read_bytes_stream.assert_called_once_with("/tmp/download.txt")
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX device file")
+    def test_download_to_null_device(self, runner: CliRunner) -> None:
+        mock_sb = MagicMock()
+        mock_sb.files.read_bytes_stream.return_value = iter([b"\x00\xff", b"data"])
+
+        result = _invoke(
+            runner,
+            ["file", "download", "sb-1", "/tmp/data.bin", os.devnull],
+            sandbox=mock_sb,
+        )
+
+        assert result.exit_code == 0, result.output
+        assert stat.S_ISCHR(Path(os.devnull).stat().st_mode)
+        mock_sb.files.read_bytes_stream.assert_called_once_with("/tmp/data.bin")
+        mock_sb.close.assert_called_once()
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX named pipes and symlinks")
+    @pytest.mark.parametrize("symlink", [False, True])
+    @pytest.mark.parametrize("failure", [None, "disconnect", "interrupt"])
+    def test_download_streams_to_fifo_without_replacing_it(
+        self, runner: CliRunner, tmp_path: Path, symlink: bool, failure: str | None
+    ) -> None:
+        fifo = tmp_path / "download.pipe"
+        os.mkfifo(fifo)
+        original_inode = fifo.stat().st_ino
+        destination = fifo
+        if symlink:
+            destination = tmp_path / "download-link"
+            destination.symlink_to(fifo.name)
+
+        def stream():
+            yield b"\x00\xfffirst"
+            if failure == "disconnect":
+                raise ConnectionError("Download disconnected")
+            if failure == "interrupt":
+                raise KeyboardInterrupt
+            yield b"second"
+
+        mock_sb = MagicMock()
+        mock_sb.files.read_bytes_stream.return_value = stream()
+        # Keep a reader connected so opening the FIFO for writing cannot block.
+        reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            result = _invoke(
+                runner,
+                ["file", "download", "sb-1", "/tmp/data.bin", str(destination)],
+                sandbox=mock_sb,
+            )
+            received = os.read(reader, 1024)
+        finally:
+            os.close(reader)
+
+        assert (result.exit_code == 0) == (failure is None), result.output
+        assert ("Downloaded:" in result.output) == (failure is None)
+        assert received == b"\x00\xfffirst" + (b"second" if failure is None else b"")
+        assert stat.S_ISFIFO(fifo.stat().st_mode)
+        assert fifo.stat().st_ino == original_inode
+        assert set(tmp_path.iterdir()) == {fifo, destination}
+        if symlink:
+            assert destination.is_symlink()
+        mock_sb.close.assert_called_once()
+
+    @pytest.mark.parametrize("existing", [False, True])
+    @pytest.mark.parametrize("failure", ["not_found", "disconnect", "interrupt"])
+    def test_failed_download_preserves_destination(
+        self, runner: CliRunner, tmp_path: Path, existing: bool, failure: str
+    ) -> None:
+        local_path = tmp_path / "result.json"
+        original = b"previous successful result"
+        if existing:
+            local_path.write_bytes(original)
+        mock_sb = MagicMock()
+        if failure == "not_found":
+            mock_sb.files.read_bytes_stream.side_effect = SandboxApiException(
+                "File not found", status_code=404
+            )
+        else:
+            def broken_stream():
+                yield b"partial download"
+                if failure == "interrupt":
+                    raise KeyboardInterrupt
+                raise ConnectionError("Download disconnected")
+
+            mock_sb.files.read_bytes_stream.return_value = broken_stream()
+
+        result = _invoke(
+            runner,
+            ["file", "download", "sb-1", "/workspace/result.json", str(local_path)],
+            sandbox=mock_sb,
+        )
+
+        assert result.exit_code != 0
+        assert "Downloaded:" not in result.output
+        if existing:
+            assert local_path.read_bytes() == original
+        else:
+            assert not local_path.exists()
+        assert set(tmp_path.iterdir()) == ({local_path} if existing else set())
+        mock_sb.close.assert_called_once()
+
+    @pytest.mark.parametrize("chunks", [[], [b"new ", b"result"]])
+    def test_download_replaces_destination_after_stream_completes(
+        self, runner: CliRunner, tmp_path: Path, chunks: list[bytes]
+    ) -> None:
+        local_path = tmp_path / "result.json"
+        original = b"previous successful result"
+        local_path.write_bytes(original)
+
+        def stream():
+            for chunk in chunks:
+                assert local_path.read_bytes() == original
+                yield chunk
+            assert local_path.read_bytes() == original
+
+        mock_sb = MagicMock()
+        mock_sb.files.read_bytes_stream.return_value = stream()
+        result = _invoke(
+            runner,
+            ["file", "download", "sb-1", "/workspace/result.json", str(local_path)],
+            sandbox=mock_sb,
+        )
+
+        assert result.exit_code == 0, result.output
+        assert local_path.read_bytes() == b"".join(chunks)
+        assert set(tmp_path.iterdir()) == {local_path}
+        mock_sb.close.assert_called_once()
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file permissions")
+    @pytest.mark.parametrize("existing", [False, True])
+    def test_download_preserves_permissions_and_respects_umask(
+        self, runner: CliRunner, tmp_path: Path, existing: bool
+    ) -> None:
+        local_path = tmp_path / "script.sh"
+        if existing:
+            local_path.write_bytes(b"old script")
+            local_path.chmod(0o754)
+        mock_sb = MagicMock()
+        mock_sb.files.read_bytes_stream.return_value = iter([b"new script"])
+
+        previous_umask = os.umask(0o077)
+        try:
+            result = _invoke(
+                runner,
+                ["file", "download", "sb-1", "/workspace/script.sh", str(local_path)],
+                sandbox=mock_sb,
+            )
+        finally:
+            os.umask(previous_umask)
+
+        assert result.exit_code == 0, result.output
+        assert local_path.read_bytes() == b"new script"
+        assert stat.S_IMODE(local_path.stat().st_mode) == (0o754 if existing else 0o600)
+
+    @pytest.mark.skipif(os.name == "nt", reason="Creating symlinks may require privileges")
+    @pytest.mark.parametrize("existing", [False, True])
+    def test_download_follows_destination_symlink(
+        self, runner: CliRunner, tmp_path: Path, existing: bool
+    ) -> None:
+        target = tmp_path / "target.json"
+        if existing:
+            target.write_bytes(b"old result")
+        link = tmp_path / "link.json"
+        link.symlink_to(target.name)
+        mock_sb = MagicMock()
+        mock_sb.files.read_bytes_stream.return_value = iter([b"new result"])
+
+        result = _invoke(
+            runner,
+            ["file", "download", "sb-1", "/workspace/result.json", str(link)],
+            sandbox=mock_sb,
+        )
+
+        assert result.exit_code == 0, result.output
+        assert link.is_symlink()
+        assert target.read_bytes() == b"new result"
+        assert set(tmp_path.iterdir()) == {link, target}
+
+    @pytest.mark.skipif(
+        os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+        reason="Requires POSIX write permission enforcement",
+    )
+    def test_download_does_not_overwrite_read_only_file(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        local_path = tmp_path / "readonly.json"
+        local_path.write_bytes(b"original")
+        local_path.chmod(0o444)
+        mock_sb = MagicMock()
+
+        result = _invoke(
+            runner,
+            ["file", "download", "sb-1", "/workspace/result.json", str(local_path)],
+            sandbox=mock_sb,
+        )
+
+        assert result.exit_code != 0
+        assert local_path.read_bytes() == b"original"
+        assert set(tmp_path.iterdir()) == {local_path}
+        mock_sb.files.read_bytes_stream.assert_not_called()
+        mock_sb.close.assert_called_once()
+
+    def test_download_rejects_directory_destination(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        mock_sb = MagicMock()
+        result = _invoke(
+            runner,
+            ["file", "download", "sb-1", "/workspace/result.json", str(tmp_path)],
+            sandbox=mock_sb,
+        )
+
+        assert result.exit_code != 0
+        assert tmp_path.is_dir()
+        assert list(tmp_path.iterdir()) == []
+        mock_sb.files.read_bytes_stream.assert_not_called()
+        mock_sb.close.assert_called_once()
+
+    def test_download_preserves_destination_when_replace_fails(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        local_path = tmp_path / "result.json"
+        local_path.write_bytes(b"original")
+        mock_sb = MagicMock()
+        mock_sb.files.read_bytes_stream.return_value = iter([b"complete download"])
+
+        with patch("os.replace", side_effect=PermissionError("Cannot replace file")):
+            result = _invoke(
+                runner,
+                ["file", "download", "sb-1", "/workspace/result.json", str(local_path)],
+                sandbox=mock_sb,
+            )
+
+        assert result.exit_code != 0
+        assert "Downloaded:" not in result.output
+        assert local_path.read_bytes() == b"original"
+        assert set(tmp_path.iterdir()) == {local_path}
+        mock_sb.close.assert_called_once()
+
 
 class TestFileRm:
     def test_rm_deletes_files(self, runner: CliRunner) -> None:
@@ -955,6 +1196,64 @@ class TestCommandSeparators:
         assert result.exit_code == 0
         mock_sb.commands.run.assert_called_once()
         assert mock_sb.commands.run.call_args.args[0] == "sh -lc 'echo ready'"
+
+    def test_command_run_argv_flag_passes_native_argv_after_separator(self, runner: CliRunner) -> None:
+        mock_sb = MagicMock()
+        execution = MagicMock()
+        execution.error = None
+        mock_sb.commands.run.return_value = execution
+
+        result = _invoke(
+            runner,
+            ["command", "run", "sb-1", "--argv", "--", "sh", "-lc", "echo ready"],
+            sandbox=mock_sb,
+            output_format="raw",
+        )
+
+        assert result.exit_code == 0
+        mock_sb.commands.run.assert_called_once()
+        assert mock_sb.commands.run.call_args.args[0] == ["sh", "-lc", "echo ready"]
+
+    def test_command_run_argv_flag_preserves_literal_arguments(self, runner: CliRunner) -> None:
+        # With --argv the trailing arguments must reach the process verbatim:
+        # literal "$HOME", embedded space, single quote, and an empty string,
+        # with no shell quoting or expansion in between.
+        mock_sb = MagicMock()
+        execution = MagicMock()
+        execution.error = None
+        mock_sb.commands.run.return_value = execution
+
+        result = _invoke(
+            runner,
+            [
+                "command",
+                "run",
+                "sb-1",
+                "--argv",
+                "--",
+                "python3",
+                "-c",
+                "import sys; print(sys.argv[1:])",
+                "a b",
+                "$HOME",
+                "x'y",
+                "",
+            ],
+            sandbox=mock_sb,
+            output_format="raw",
+        )
+
+        assert result.exit_code == 0
+        mock_sb.commands.run.assert_called_once()
+        assert mock_sb.commands.run.call_args.args[0] == [
+            "python3",
+            "-c",
+            "import sys; print(sys.argv[1:])",
+            "a b",
+            "$HOME",
+            "x'y",
+            "",
+        ]
 
     def test_command_run_help_mentions_separator_rule(self, runner: CliRunner) -> None:
         result = runner.invoke(cli, ["command", "run", "--help"])
@@ -1214,6 +1513,26 @@ class TestCommandRun:
         data = json.loads(result.output)
         assert data["execution_id"] == "exec-123"
         assert data["mode"] == "background"
+        mock_sb.commands.run.assert_called_once()
+        assert mock_sb.commands.run.call_args.args[0] == "echo hello"
+
+    def test_background_run_argv_flag_passes_native_argv(self, runner: CliRunner) -> None:
+        mock_sb = MagicMock()
+        mock_execution = MagicMock()
+        mock_execution.id = "exec-123"
+        mock_sb.commands.run.return_value = mock_execution
+
+        result = _invoke(
+            runner,
+            ["command", "run", "sb-1", "-d", "--argv", "echo", "hello", "-o", "json"],
+            sandbox=mock_sb,
+        )
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["execution_id"] == "exec-123"
+        assert data["mode"] == "background"
+        mock_sb.commands.run.assert_called_once()
+        assert mock_sb.commands.run.call_args.args[0] == ["echo", "hello"]
 
     def test_foreground_run_rejects_json_output(self, runner: CliRunner) -> None:
         result = _invoke(

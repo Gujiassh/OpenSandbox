@@ -34,7 +34,6 @@ jobs:
           - module: components/nodeagent
           - module: kubernetes
           - module: sdks/sandbox/go
-          - module: sdks/sandbox/go/poolredis
           - module: tests/go
           - module: examples/chrome
     steps:

@@ -39,7 +39,7 @@ class _FakeStreamingResponse:
     def __init__(
         self,
         status_code: int = 200,
-        headers: dict | None = None,
+        headers: dict | list[tuple[str, str]] | None = None,
         chunks: list[bytes] | None = None,
         raw_chunks: list[bytes] | None = None,
     ):
@@ -544,8 +544,8 @@ def test_proxy_forwards_filtered_headers_and_query(
 
     assert fake_client.built is not None
     assert fake_client.built["method"] == "POST"
-    assert fake_client.built["url"] == "http://10.57.1.91:40109/api/run"
-    assert fake_client.built["params"] == "q=search"
+    assert fake_client.built["url"] == "http://10.57.1.91:40109/api/run?q=search"
+    assert fake_client.built["params"] is None
     forwarded_headers = fake_client.built["headers"]
     lowered_headers = {k.lower(): v for k, v in forwarded_headers.items()}
     assert "host" not in lowered_headers
@@ -778,8 +778,8 @@ def test_proxy_root_path_forwards_endpoint_headers_and_query(
     assert response.status_code == 200
     assert response.content == b"root-ok"
     assert fake_client.built is not None
-    assert fake_client.built["url"] == "http://10.57.1.91:40109/base"
-    assert fake_client.built["params"] == "q=search"
+    assert fake_client.built["url"] == "http://10.57.1.91:40109/base?q=search"
+    assert fake_client.built["params"] is None
     lowered_headers = {
         key.lower(): value for key, value in fake_client.built["headers"].items()
     }
@@ -792,7 +792,6 @@ def test_proxy_rejects_missing_secure_access_header(
     auth_headers: dict,
     monkeypatch,
 ) -> None:
-    """Regression test: requests without the required secure-access token are rejected."""
     class StubService:
         @staticmethod
         def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
@@ -828,7 +827,6 @@ def test_proxy_rejects_mismatched_secure_access_header(
     auth_headers: dict,
     monkeypatch,
 ) -> None:
-    """Regression test: requests with a wrong secure-access token are rejected."""
     class StubService:
         @staticmethod
         def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
@@ -911,11 +909,10 @@ def test_proxy_forwards_get_request_with_query_params(
     auth_headers: dict,
     monkeypatch,
 ) -> None:
-    """Test that GET requests with query parameters are forwarded correctly.
-
+    """
     This test verifies the fix for issue #484 where GET requests with query
     parameters were failing with 400 MISSING_QUERY when using use_server_proxy.
-    The query string should be passed via httpx params, not embedded in URL.
+    The query string must reach the backend URL.
     """
     class StubService:
         @staticmethod
@@ -944,9 +941,48 @@ def test_proxy_forwards_get_request_with_query_params(
     assert response.status_code == 200
     assert fake_client.built is not None
     assert fake_client.built["method"] == "GET"
-    assert fake_client.built["url"] == "http://10.57.1.91:40109/files/search"
-    assert fake_client.built["params"] == "path=%2Fworkspace"
+    assert fake_client.built["url"] == "http://10.57.1.91:40109/files/search?path=%2Fworkspace"
+    assert fake_client.built["params"] is None
     assert fake_client.built["content"] is None
+
+
+def test_proxy_forwards_raw_query_string_unchanged(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
+            return Endpoint(endpoint="10.57.1.91:40109")
+
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+
+    seen: list[bytes] = []
+
+    class _Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"ok"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.raw_path)
+        return httpx.Response(200, stream=_Body())
+
+    _set_http_client(
+        client,
+        cast(Any, httpx.AsyncClient(transport=httpx.MockTransport(handler))),
+    )
+
+    # Repeated keys out of order, a valueless flag, a non-UTF-8 escape, a
+    # literal ';' and a %20 space must all reach the backend byte for byte.
+    raw_query = "b=2&a=1&b=3&uploads&sig=%E9%FF&s=1;2&q=hello%20world"
+    response = client.get(
+        f"/v1/sandboxes/sbx-123/proxy/44772/files/search?{raw_query}",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert seen == [f"/files/search?{raw_query}".encode("ascii")]
 
 
 def test_proxy_forwards_delete_request_with_body(
@@ -954,11 +990,6 @@ def test_proxy_forwards_delete_request_with_body(
     auth_headers: dict,
     monkeypatch,
 ) -> None:
-    """Test that DELETE requests with body payload are forwarded correctly.
-
-    This verifies that DELETE requests with JSON/body payload are not
-    incorrectly stripped when proxying.
-    """
     class StubService:
         @staticmethod
         def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
@@ -1028,6 +1059,60 @@ def test_proxy_filters_response_hop_by_hop_headers(
     assert response.headers.get("x-hop-temp") is None
 
 
+@pytest.mark.parametrize("status_code", [200, 302, 400])
+def test_proxy_preserves_repeated_response_headers(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+    status_code: int,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_endpoint(*args, **kwargs) -> Endpoint:
+            return Endpoint(endpoint="10.57.1.91:40109")
+
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+    cookies = [
+        "session=abc; Path=/; HttpOnly; Expires=Wed, 09 Jun 2027 10:18:14 GMT",
+        "theme=dark; Path=/; SameSite=Lax",
+    ]
+    fake_client = _FakeAsyncClient()
+    fake_client.response = _FakeStreamingResponse(
+        status_code=status_code,
+        headers=[
+            ("Set-Cookie", cookies[0]),
+            ("set-cookie", cookies[1]),
+            ("X-Backend", "first"),
+            ("x-backend", "second"),
+            ("Connection", "X-Hop-One"),
+            ("connection", "X-Hop-Two"),
+            ("X-Hop-One", "drop-first"),
+            ("x-hop-one", "drop-second"),
+            ("X-Hop-Two", "drop-third"),
+            ("Server", "backend-one"),
+            ("server", "backend-two"),
+            ("Location", "/login"),
+        ],
+        chunks=[b"proxy-ok"],
+    )
+    _set_http_client(client, fake_client)
+
+    response = client.get(
+        "/v1/sandboxes/sbx-123/proxy/44772/healthz",
+        headers=auth_headers,
+        follow_redirects=False,
+    )
+
+    assert response.status_code == status_code
+    assert response.content == b"proxy-ok"
+    assert response.headers.get_list("set-cookie") == cookies
+    assert response.headers.get_list("x-backend") == ["first", "second"]
+    assert response.headers["location"] == "/v1/sandboxes/sbx-123/proxy/44772/login"
+    for name in ("connection", "x-hop-one", "x-hop-two", "server"):
+        assert name not in response.headers
+    assert fake_client.response.aclose_called is True
+
+
 def test_proxy_streams_raw_body_for_content_encoded_response(
     client: TestClient,
     auth_headers: dict,
@@ -1076,7 +1161,7 @@ def test_proxy_closes_backend_response_when_downstream_rejects_headers() -> None
         response = proxy_api._ProxyStreamingResponse(
             cast(httpx.Response, backend_response),
             status_code=200,
-            headers={},
+            raw_headers=[],
         )
 
         async def receive() -> Message:
@@ -1110,7 +1195,7 @@ def test_proxy_closes_backend_response_when_stream_is_cancelled() -> None:
         response = proxy_api._ProxyStreamingResponse(
             cast(httpx.Response, backend_response),
             status_code=200,
-            headers={},
+            raw_headers=[],
         )
 
         async def send(message: Message) -> None:
@@ -1408,3 +1493,50 @@ def test_proxy_active_credential_vault_returns_sidecar_forbidden(
     assert response.content == b"forbidden\n"
     assert fake_client.built is not None
     assert fake_client.built["url"] == "http://10.57.1.91:18080/credential-vault/_active"
+
+
+def test_networkpolicy_route_forwards_egress_auth_header(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_endpoint(sandbox_id: str, port: int, resolve_internal: bool = False, use_proxy_host: bool = False) -> Endpoint:
+            assert port == 18080
+            return Endpoint(
+                endpoint="10.57.1.91:18080",
+                headers={OPEN_SANDBOX_EGRESS_AUTH_HEADER: "injected-egress-token"},
+            )
+
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+
+    fake_client = _FakeAsyncClient()
+    fake_client.response = _FakeStreamingResponse(
+        status_code=200,
+        headers={"content-type": "application/json"},
+        chunks=[b'{"status":"ok"}'],
+    )
+    _set_http_client(client, fake_client)
+
+    response = client.get(
+        "/v1/sandboxes/sbx-123/networkpolicy",
+        headers={
+            **auth_headers,
+            OPEN_SANDBOX_EGRESS_AUTH_HEADER.lower(): "caller-fake-token",
+        },
+    )
+
+    assert response.status_code == 200
+    assert fake_client.built is not None
+    assert fake_client.built["url"] == "http://10.57.1.91:18080/policy"
+    # Ensure caller-supplied header was completely replaced and does not duplicate
+    egress_headers = [
+        (k, v)
+        for k, v in fake_client.built["headers"].items()
+        if k.lower() == OPEN_SANDBOX_EGRESS_AUTH_HEADER.lower()
+    ]
+    assert len(egress_headers) == 1
+    assert egress_headers[0][1] == "injected-egress-token"
+
+

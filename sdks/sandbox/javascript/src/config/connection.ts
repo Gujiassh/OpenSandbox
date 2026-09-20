@@ -68,6 +68,11 @@ export interface ConnectionConfigOptions {
    * Also honored via `OPENSANDBOX_DISABLE_METRICS=1`.
    */
   disableMetrics?: boolean;
+  /**
+   * Enable OpenTelemetry tracing for client-side pool warmup.
+   * Off by default.
+   */
+  enableTracing?: boolean;
 }
 
 function isNodeRuntime(): boolean {
@@ -310,6 +315,7 @@ export class ConnectionConfig {
   readonly endpointCacheSize: number;
   readonly endpointCacheDisabled: boolean;
   readonly disableMetrics: boolean;
+  readonly enableTracing: boolean;
   private _closeTransport: () => Promise<void>;
   private _closePromise: Promise<void> | null = null;
   private _transportInitialized = false;
@@ -343,6 +349,7 @@ export class ConnectionConfig {
     this.endpointCacheSize = opts.endpointCacheSize ?? 1024;
     this.endpointCacheDisabled = !!opts.endpointCacheDisabled;
     this.disableMetrics = !!opts.disableMetrics;
+    this.enableTracing = !!opts.enableTracing;
 
     const headers: Record<string, string> = { ...(opts.headers ?? {}) };
     // Attach API key via header unless the user already provided one.
@@ -431,6 +438,7 @@ export class ConnectionConfig {
       endpointCacheSize: this.endpointCacheSize,
       endpointCacheDisabled: this.endpointCacheDisabled,
       disableMetrics: this.disableMetrics,
+      enableTracing: this.enableTracing,
     });
     clone.initializeTransport();
     return clone;

@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="920" viewBox="0 0 1400 920" role="img" aria-labelledby="title desc">
+  <title id="title">Staged Client Pool Warmup</title>
+  <desc id="desc">Flowchart for staged warmup. A leader reconcile tick admits a bounded batch. Creation and post-create work use separate concurrency limits. Readiness retries release capacity while delayed. Successful work renews the sandbox and passes leader fencing before entering the idle buffer; failures are cleaned up.</desc>
+  <defs>
+    <marker id="sw-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1e3a5f"/>
+    </marker>
+    <marker id="sw-arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b91c1c"/>
+    </marker>
+    <style>
+      text { font-family: Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+      .title { font-size: 26px; font-weight: 700; fill: #1e40af; }
+      .subtitle { font-size: 13px; fill: #475569; }
+      .box-title { font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .box-text { font-size: 12px; fill: #334155; }
+      .gate-title { font-size: 14px; font-weight: 700; fill: #6d28d9; }
+      .edge-label { font-size: 11px; fill: #475569; }
+      .edge-label-red { font-size: 11px; fill: #b91c1c; }
+      .caption { font-size: 12px; fill: #475569; font-style: italic; }
+      .flow { stroke: #1e3a5f; stroke-width: 2; fill: none; marker-end: url(#sw-arrow); }
+      .failure { stroke: #b91c1c; stroke-width: 1.8; fill: none; stroke-dasharray: 6,4; marker-end: url(#sw-arrow-red); }
+    </style>
+  </defs>
+
+  <text x="700" y="38" class="title" text-anchor="middle">Staged Warmup Pipeline</text>
+  <text x="700" y="62" class="subtitle" text-anchor="middle">Create admission and post-create work are controlled independently</text>
+
+  <!-- Admission -->
+  <rect x="50" y="105" width="270" height="125" rx="10" fill="#eff6ff" stroke="#1e3a5f" stroke-width="2"/>
+  <text x="185" y="135" class="box-title" text-anchor="middle">Leader reconcile tick</text>
+  <text x="185" y="164" class="box-text" text-anchor="middle">deficit = maxIdle - idle - warming</text>
+  <text x="185" y="190" class="box-text" text-anchor="middle">admit ≤ warmupCreateQps</text>
+  <text x="185" y="212" class="box-text" text-anchor="middle">per completed tick</text>
+
+  <rect x="385" y="105" width="270" height="125" rx="10" fill="#faf5ff" stroke="#6d28d9" stroke-width="2"/>
+  <text x="520" y="135" class="gate-title" text-anchor="middle">Create capacity gate</text>
+  <text x="520" y="166" class="box-text" text-anchor="middle">active create ≤</text>
+  <text x="520" y="190" class="box-text" text-anchor="middle">ceil(warmupCreateQps × 1.5)</text>
+  <text x="520" y="212" class="box-text" text-anchor="middle">independent of warmupConcurrency</text>
+
+  <rect x="720" y="105" width="270" height="125" rx="10" fill="#ecfdf5" stroke="#047857" stroke-width="2"/>
+  <text x="855" y="135" class="box-title" text-anchor="middle">Lifecycle create</text>
+  <text x="855" y="166" class="box-text" text-anchor="middle">single create attempt</text>
+  <text x="855" y="190" class="box-text" text-anchor="middle">skip inline readiness</text>
+  <text x="855" y="212" class="box-text" text-anchor="middle">return Sandbox client</text>
+
+  <rect x="1055" y="105" width="270" height="125" rx="10" fill="#f8fafc" stroke="#64748b" stroke-width="2"/>
+  <text x="1190" y="135" class="box-title" text-anchor="middle">Initial delay</text>
+  <text x="1190" y="166" class="box-text" text-anchor="middle">warmupHealthCheckInitialDelay</text>
+  <text x="1190" y="190" class="box-text" text-anchor="middle">bounded by ready timeout</text>
+  <text x="1190" y="212" class="box-text" text-anchor="middle">does not hold post-create capacity</text>
+
+  <path d="M 320 168 L 383 168" class="flow"/>
+  <path d="M 655 168 L 718 168" class="flow"/>
+  <path d="M 990 168 L 1053 168" class="flow"/>
+
+  <!-- Post-create gate and readiness -->
+  <path d="M 1190 230 L 1190 287 L 990 287" class="flow"/>
+
+  <rect x="720" y="265" width="270" height="105" rx="10" fill="#faf5ff" stroke="#6d28d9" stroke-width="2"/>
+  <text x="855" y="296" class="gate-title" text-anchor="middle">Post-create capacity gate</text>
+  <text x="855" y="326" class="box-text" text-anchor="middle">active work ≤ warmupConcurrency</text>
+  <text x="855" y="350" class="box-text" text-anchor="middle">separate from create admission</text>
+
+  <polygon points="520,260 650,317 520,374 390,317" fill="#fff7ed" stroke="#c2410c" stroke-width="2"/>
+  <text x="520" y="306" class="box-title" text-anchor="middle">Ready?</text>
+  <text x="520" y="328" class="box-text" text-anchor="middle">health check attempt</text>
+  <text x="520" y="348" class="box-text" text-anchor="middle">before deadline</text>
+
+  <rect x="50" y="265" width="270" height="105" rx="10" fill="#f8fafc" stroke="#64748b" stroke-width="2"/>
+  <text x="185" y="296" class="box-title" text-anchor="middle">Delayed retry</text>
+  <text x="185" y="326" class="box-text" text-anchor="middle">release active capacity</text>
+  <text x="185" y="350" class="box-text" text-anchor="middle">wait polling interval</text>
+
+  <path d="M 720 317 L 652 317" class="flow"/>
+  <path d="M 390 317 L 322 317" class="flow"/>
+  <text x="354" y="304" class="edge-label">not ready</text>
+  <path d="M 185 370 L 185 415 L 855 415 L 855 372" class="flow"/>
+  <text x="520" y="407" class="edge-label" text-anchor="middle">retry while warmupReadyTimeout remains</text>
+
+  <!-- Prepare and validate -->
+  <path d="M 520 374 L 520 470" class="flow"/>
+  <text x="535" y="430" class="edge-label">ready</text>
+
+  <rect x="385" y="470" width="270" height="105" rx="10" fill="#ecfdf5" stroke="#047857" stroke-width="2"/>
+  <text x="520" y="501" class="box-title" text-anchor="middle">Prepare once</text>
+  <text x="520" y="531" class="box-text" text-anchor="middle">optional sandboxPreparer</text>
+  <text x="520" y="553" class="box-text" text-anchor="middle">never rerun during validation retries</text>
+
+  <rect x="720" y="470" width="270" height="105" rx="10" fill="#fff7ed" stroke="#c2410c" stroke-width="2"/>
+  <text x="855" y="501" class="box-title" text-anchor="middle">Post-prepare validation</text>
+  <text x="855" y="531" class="box-text" text-anchor="middle">optional health check</text>
+  <text x="855" y="553" class="box-text" text-anchor="middle">retry until its own timeout</text>
+
+  <path d="M 655 522 L 718 522" class="flow"/>
+
+  <!-- Commit -->
+  <rect x="1055" y="470" width="270" height="105" rx="10" fill="#eff6ff" stroke="#1e3a5f" stroke-width="2"/>
+  <text x="1190" y="501" class="box-title" text-anchor="middle">Renew sandbox TTL</text>
+  <text x="1190" y="531" class="box-text" text-anchor="middle">renew(idleTimeout)</text>
+  <text x="1190" y="553" class="box-text" text-anchor="middle">before idle publication</text>
+  <path d="M 990 522 L 1053 522" class="flow"/>
+
+  <rect x="720" y="640" width="270" height="115" rx="10" fill="#fff7ed" stroke="#c2410c" stroke-width="2"/>
+  <text x="855" y="670" class="box-title" text-anchor="middle">Fenced commit</text>
+  <text x="855" y="699" class="box-text" text-anchor="middle">run generation + leader epoch</text>
+  <text x="855" y="723" class="box-text" text-anchor="middle">renew primary lease</text>
+  <text x="855" y="745" class="box-text" text-anchor="middle">namespace must remain ACTIVE</text>
+
+  <rect x="1055" y="640" width="270" height="115" rx="10" fill="#ecfdf5" stroke="#047857" stroke-width="2"/>
+  <text x="1190" y="670" class="box-title" text-anchor="middle">Publish idle</text>
+  <text x="1190" y="699" class="box-text" text-anchor="middle">putIdle(sandboxId)</text>
+  <text x="1190" y="723" class="box-text" text-anchor="middle">close local client</text>
+  <text x="1190" y="745" class="box-text" text-anchor="middle">remote sandbox stays ready</text>
+
+  <path d="M 1190 575 L 1190 610 L 855 610 L 855 638" class="flow"/>
+  <path d="M 990 697 L 1053 697" class="flow"/>
+
+  <!-- Failure cleanup -->
+  <rect x="385" y="805" width="610" height="72" rx="10" fill="#fef2f2" stroke="#b91c1c" stroke-width="2"/>
+  <text x="690" y="833" class="box-title" text-anchor="middle">Failure, cancellation, timeout, or stale leadership</text>
+  <text x="690" y="858" class="box-text" text-anchor="middle">do not publish idle → best-effort kill remote sandbox → close local client</text>
+
+  <path d="M 520 575 L 520 803" class="failure"/>
+  <path d="M 855 575 L 855 600 L 690 600 L 690 803" class="failure"/>
+  <path d="M 855 755 L 855 803" class="failure"/>
+  <text x="530" y="786" class="edge-label-red">any stage failure</text>
+
+  <text x="700" y="907" class="caption" text-anchor="middle">warmupCreateQps controls admission; warmupConcurrency controls active post-create work; neither is a completed-QPS guarantee.</text>
+</svg>

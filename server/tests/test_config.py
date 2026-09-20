@@ -285,6 +285,20 @@ def test_postgresql_store_validates_pool_size():
         )
 
 
+def test_postgresql_store_snapshot_recovery_interval_is_positive():
+    config = PostgreSQLStoreConfig(
+        dsn=SecretStr("postgresql://localhost/opensandbox"),
+    )
+
+    assert config.snapshot_recovery_interval_seconds == 15
+
+    with pytest.raises(ValueError):
+        PostgreSQLStoreConfig(
+            dsn=SecretStr("postgresql://localhost/opensandbox"),
+            snapshot_recovery_interval_seconds=0,
+        )
+
+
 def test_renew_intent_defaults():
     cfg = AppConfig(runtime=RuntimeConfig(type="docker", execd_image="opensandbox/execd:latest"))
     ar = cfg.renew_intent
@@ -867,7 +881,6 @@ def test_secure_runtime_empty_type_is_valid():
 
 
 def test_secure_runtime_gvisor_with_docker_runtime_is_valid():
-    """gVisor with docker_runtime should be valid."""
     cfg = config_module.SecureRuntimeConfig(
         type="gvisor",
         docker_runtime="runsc",
@@ -891,7 +904,6 @@ def test_secure_runtime_gvisor_with_k8s_runtime_class_is_valid():
 
 
 def test_secure_runtime_kata_with_runtimes_is_valid():
-    """Kata with both runtimes should be valid."""
     cfg = config_module.SecureRuntimeConfig(
         type="kata",
         docker_runtime="kata-runtime",
@@ -903,7 +915,6 @@ def test_secure_runtime_kata_with_runtimes_is_valid():
 
 
 def test_secure_runtime_firecracker_with_k8s_runtime_is_valid():
-    """Firecracker with k8s_runtime_class should be valid."""
     cfg = config_module.SecureRuntimeConfig(
         type="firecracker",
         docker_runtime="",
@@ -915,7 +926,6 @@ def test_secure_runtime_firecracker_with_k8s_runtime_is_valid():
 
 
 def test_secure_runtime_firecracker_without_k8s_runtime_raises_error():
-    """Firecracker without k8s_runtime_class should raise error."""
     with pytest.raises(ValueError) as exc:
         config_module.SecureRuntimeConfig(
             type="firecracker",
@@ -926,7 +936,6 @@ def test_secure_runtime_firecracker_without_k8s_runtime_raises_error():
 
 
 def test_secure_runtime_gvisor_without_any_runtime_raises_error():
-    """gVisor without any runtime configured should raise error."""
     with pytest.raises(ValueError) as exc:
         config_module.SecureRuntimeConfig(
             type="gvisor",
@@ -937,7 +946,6 @@ def test_secure_runtime_gvisor_without_any_runtime_raises_error():
 
 
 def test_secure_runtime_kata_without_any_runtime_raises_error():
-    """Kata without any runtime configured should raise error."""
     with pytest.raises(ValueError) as exc:
         config_module.SecureRuntimeConfig(
             type="kata",
@@ -948,13 +956,11 @@ def test_secure_runtime_kata_without_any_runtime_raises_error():
 
 
 def test_secure_runtime_invalid_type_raises_error():
-    """Invalid type should raise ValidationError."""
     with pytest.raises(Exception):
         config_module.SecureRuntimeConfig(type="invalid_runtime")
 
 
 def test_app_config_with_secure_runtime():
-    """AppConfig should parse secure_runtime section."""
     cfg = AppConfig(
         runtime={"type": "docker", "execd_image": "execd:v1"},
         secure_runtime={
@@ -969,7 +975,6 @@ def test_app_config_with_secure_runtime():
 
 
 def test_app_config_without_secure_runtime():
-    """AppConfig without secure_runtime should have None."""
     cfg = AppConfig(
         runtime={"type": "docker", "execd_image": "execd:v1"},
     )
@@ -1025,7 +1030,6 @@ def test_docker_runtime_with_firecracker_raises_error():
 
 
 def test_kubernetes_runtime_with_firecracker_is_valid():
-    """Kubernetes runtime with Firecracker should be valid."""
     cfg = AppConfig(
         runtime={"type": "kubernetes", "execd_image": "execd:v1"},
         kubernetes={"namespace": "default"},
@@ -1255,7 +1259,6 @@ def test_load_config_rejects_invalid_egress_resources_at_startup(
 
 
 def test_log_config_defaults():
-    """LogConfig should have sensible defaults."""
     cfg = LogConfig()
     assert cfg.level == "INFO"
     assert cfg.file_enabled is False
@@ -1266,7 +1269,6 @@ def test_log_config_defaults():
 
 
 def test_log_config_resolved_file_path():
-    """resolved_file_path() should return None when file_enabled=False."""
     cfg = LogConfig(file_enabled=False)
     assert cfg.resolved_file_path() is None
 
@@ -1280,7 +1282,6 @@ def test_log_config_resolved_file_path():
 
 
 def test_log_config_resolved_access_file_path():
-    """resolved_access_file_path() should return default path when file_enabled."""
     # file_enabled=False always returns None
     cfg = LogConfig(file_enabled=False, access_file_path="/path/access.log")
     assert cfg.resolved_access_file_path() is None
@@ -1321,7 +1322,6 @@ def test_log_config_file_backup_count_validation():
 
 
 def test_app_config_log_defaults():
-    """AppConfig should include default LogConfig."""
     cfg = AppConfig(
         runtime=RuntimeConfig(type="docker", execd_image="test:latest")
     )

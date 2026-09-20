@@ -53,8 +53,15 @@ Config fields:
 
 ```bash
 opensandbox-mcp \
-  --transport streamable-http
+  --transport streamable-http \
+  --host 0.0.0.0 \
+  --port 8000
 ```
+
+The HTTP transport defaults to `127.0.0.1:8000`. Set `--host 0.0.0.0` when
+the MCP server must be reached from another container, and use `--port` to
+select a different listening port. Keep the default loopback host unless the
+container network or an upstream gateway protects the exposed endpoint.
 
 ## Integrations
 
@@ -104,9 +111,16 @@ claude mcp add opensandbox-sandbox --transport http http://localhost:8000/mcp
 ## Tools
 
 ::: info
-- All tools operate on a `sandbox_id` returned by `sandbox_create` or `sandbox_connect`.
+- Tools that interact with a sandbox use an ID registered by `sandbox_create` or
+  `sandbox_connect`. `sandbox_list` lists server-side sandboxes without an existing
+  local sandbox registration.
 - `file_read`/`file_write` are text-only; use `encoding` and `range_header` for large files.
 :::
+
+The MCP server exposes the tool set below, not the complete Python SDK. It does
+not currently register tools for Client Pool, pool tracing, snapshots, templates,
+Credential Vault, or stable remote diagnostic logs/events. Use the
+[SDK guides](/sdks/) or [CLI](/cli/) for those workflows where supported.
 
 ### Sandbox
 

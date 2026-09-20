@@ -115,6 +115,10 @@ class ConnectionConfig(BaseModel):
             "Also honored via OPENSANDBOX_DISABLE_METRICS=1."
         ),
     )
+    enable_tracing: bool = Field(
+        default=False,
+        description="Enable OpenTelemetry tracing for SDK operations.",
+    )
 
     # Environment variable names
     _ENV_API_KEY = "OPEN_SANDBOX_API_KEY"
@@ -132,7 +136,13 @@ class ConnectionConfig(BaseModel):
 
         client_ip.apply_client_ip(self.headers)
 
-    def with_transport_if_missing(self) -> "ConnectionConfig":
+    def with_transport_if_missing(
+        self,
+        *,
+        max_connections: int | None = 100,
+        max_keepalive_connections: int = 20,
+        keepalive_expiry: float = 30.0,
+    ) -> "ConnectionConfig":
         """
         Ensure a transport exists for this SDK resource.
 
@@ -146,16 +156,14 @@ class ConnectionConfig(BaseModel):
             return self
         inner = httpx.AsyncHTTPTransport(
             limits=httpx.Limits(
-                max_connections=100,
-                max_keepalive_connections=20,
-                keepalive_expiry=30.0,
+                max_connections=max_connections,
+                max_keepalive_connections=max_keepalive_connections,
+                keepalive_expiry=keepalive_expiry,
             ),
         )
         wrapped: httpx.AsyncBaseTransport
         if self.retry_policy.wraps_transport():
-            wrapped = RetryAsyncTransport(
-                inner, self.retry_policy, owns_inner=True
-            )
+            wrapped = RetryAsyncTransport(inner, self.retry_policy, owns_inner=True)
         else:
             wrapped = inner
         config = self.model_copy(update={"transport": wrapped})
@@ -205,8 +213,6 @@ class ConnectionConfig(BaseModel):
         """Get the full base URL for API requests."""
         domain = self.get_domain()
         # Allow domain to override protocol if it explicitly starts with a scheme
-        if domain.startswith("http://") or domain.startswith(
-            "https://"
-        ):
+        if domain.startswith("http://") or domain.startswith("https://"):
             return f"{domain}/{self._API_VERSION}"
         return f"{self.protocol}://{domain}/{self._API_VERSION}"

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,8 +28,11 @@ echo "Working directory: $(pwd)"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CURRENT_YEAR="$(date +%Y)"
 MIN_YEAR="2025"
-LICENSE_OWNER="Alibaba Group Holding Ltd."
-LICENSE_REGEX="Copyright [0-9]{4} ${LICENSE_OWNER// / }"
+LICENSE_OWNER="The OpenSandbox Authors"
+# Dual acceptance is intentional during the transition period following donation to AAIF.
+# Allows verification to pass while remaining legacy files are migrated in follow-up PRs.
+# TODO: Once the codebase-wide migration is complete, drop the Alibaba Group Holding Ltd. fallback branch.
+LICENSE_REGEX="Copyright [0-9]{4} (${LICENSE_OWNER// / }|Alibaba Group Holding Ltd\.)"
 
 # File extensions that are expected to carry a license header.
 LICENSE_EXTS=(

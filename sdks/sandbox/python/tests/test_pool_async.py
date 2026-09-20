@@ -16,14 +16,13 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Any, cast
 
 import httpx
 import pytest
 
 from opensandbox._async_pool_reconciler import run_async_reconcile_tick
-from opensandbox._pool_reconciler import ReconcileState
 from opensandbox.config import ConnectionConfig
 from opensandbox.exceptions import (
     PoolAcquireFailedException,
@@ -41,6 +40,7 @@ from opensandbox.pool import (
     PooledSandboxCreateReason,
     SandboxPoolAsync,
 )
+from opensandbox.pool_types import PoolLifecycleState
 
 
 @pytest.mark.asyncio
@@ -184,7 +184,7 @@ async def test_release_all_idle_parallel_finishes_kills_before_cancellation() ->
 
 
 @pytest.mark.asyncio
-async def test_async_reconcile_batch_failures_only_advance_backoff_once() -> None:
+async def test_async_reconcile_submits_at_most_warmup_create_qps() -> None:
     store = InMemoryAsyncPoolStateStore()
     config = AsyncPoolConfig(
         pool_name="pool",
@@ -195,146 +195,66 @@ async def test_async_reconcile_batch_failures_only_advance_backoff_once() -> Non
         connection_config=ConnectionConfig(),
         creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
     )
-    state = ReconcileState(degraded_threshold=3)
+    submitted: list[int] = []
+    await run_async_reconcile_tick(
+        config=config,
+        state_store=store,
+        on_discard_sandbox=_noop_discard,
+        warming_count=0,
+        submit_warmups=submitted.append,
+    )
+    assert submitted == [10]
 
-    async def fail_create() -> str:
-        raise RuntimeError("boom")
+
+@pytest.mark.asyncio
+async def test_async_reconcile_accounts_for_warming_before_admission() -> None:
+    store = InMemoryAsyncPoolStateStore()
+    config = AsyncPoolConfig(
+        pool_name="pool",
+        owner_id="owner-1",
+        max_idle=2,
+        warmup_concurrency=2,
+        state_store=store,
+        connection_config=ConnectionConfig(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+    )
+    submitted: list[int] = []
+    await run_async_reconcile_tick(
+        config=config,
+        state_store=store,
+        on_discard_sandbox=_noop_discard,
+        warming_count=1,
+        submit_warmups=submitted.append,
+    )
+    assert submitted == [1]
+
+
+@pytest.mark.asyncio
+async def test_async_reconcile_returns_without_waiting_for_submitted_warmup() -> None:
+    store = InMemoryAsyncPoolStateStore()
+    config = AsyncPoolConfig(
+        pool_name="pool",
+        owner_id="owner-1",
+        max_idle=2,
+        warmup_concurrency=2,
+        state_store=store,
+        connection_config=ConnectionConfig(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+    )
+    called = asyncio.Event()
+
+    def submit(count: int) -> None:
+        assert count == 2
+        called.set()
 
     await run_async_reconcile_tick(
         config=config,
         state_store=store,
-        create_one=fail_create,
         on_discard_sandbox=_noop_discard,
-        reconcile_state=state,
+        warming_count=0,
+        submit_warmups=submit,
     )
-
-    assert state.failure_count == 10
-    assert state.is_backoff_active(datetime.now(timezone.utc) + timedelta(seconds=29))
-    assert not state.is_backoff_active(
-        datetime.now(timezone.utc) + timedelta(seconds=31)
-    )
-
-
-@pytest.mark.asyncio
-async def test_async_reconcile_commits_fast_warmup_before_slow_peer_finishes() -> (
-    None
-):
-    store = InMemoryAsyncPoolStateStore()
-    config = AsyncPoolConfig(
-        pool_name="pool",
-        owner_id="owner-1",
-        max_idle=2,
-        warmup_concurrency=2,
-        state_store=store,
-        connection_config=ConnectionConfig(),
-        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
-    )
-    state = ReconcileState(degraded_threshold=3)
-    slow_started = asyncio.Event()
-    release_slow = asyncio.Event()
-    calls = 0
-
-    async def create_one() -> str:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            slow_started.set()
-            await release_slow.wait()
-            return "slow"
-        await slow_started.wait()
-        return "fast"
-
-    reconcile_task = asyncio.create_task(
-        run_async_reconcile_tick(
-            config=config,
-            state_store=store,
-            create_one=create_one,
-            on_discard_sandbox=_noop_discard,
-            reconcile_state=state,
-        )
-    )
-
-    async def fast_is_idle() -> bool:
-        return (await store.snapshot_counters("pool")).idle_count == 1
-
-    try:
-        await asyncio.wait_for(slow_started.wait(), timeout=2)
-        await _eventually(fast_is_idle)
-        assert not reconcile_task.done()
-        assert await store.try_take_idle("pool") == "fast"
-    finally:
-        release_slow.set()
-        await asyncio.wait_for(reconcile_task, timeout=2)
-
-    assert await store.try_take_idle("pool") == "slow"
-
-
-@pytest.mark.asyncio
-async def test_async_reconcile_cancellation_discards_uncommitted_warmup() -> None:
-    store = InMemoryAsyncPoolStateStore()
-    config = AsyncPoolConfig(
-        pool_name="pool",
-        owner_id="owner-1",
-        max_idle=2,
-        warmup_concurrency=2,
-        state_store=store,
-        connection_config=ConnectionConfig(),
-        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
-    )
-    state = ReconcileState(degraded_threshold=3)
-    slow_started = asyncio.Event()
-    discard_started = asyncio.Event()
-    release_discard = asyncio.Event()
-    discarded: list[str] = []
-    calls = 0
-
-    async def create_one() -> str:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            slow_started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                return "late"
-        await slow_started.wait()
-        return "fast"
-
-    async def discard(sandbox_id: str) -> None:
-        discard_started.set()
-        await release_discard.wait()
-        discarded.append(sandbox_id)
-
-    reconcile_task = asyncio.create_task(
-        run_async_reconcile_tick(
-            config=config,
-            state_store=store,
-            create_one=create_one,
-            on_discard_sandbox=discard,
-            reconcile_state=state,
-        )
-    )
-
-    async def fast_is_idle() -> bool:
-        return (await store.snapshot_counters("pool")).idle_count == 1
-
-    try:
-        await asyncio.wait_for(slow_started.wait(), timeout=2)
-        await _eventually(fast_is_idle)
-        reconcile_task.cancel()
-        await asyncio.wait_for(discard_started.wait(), timeout=2)
-        reconcile_task.cancel()
-        release_discard.set()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(reconcile_task, timeout=2)
-    finally:
-        release_discard.set()
-        reconcile_task.cancel()
-        await asyncio.gather(reconcile_task, return_exceptions=True)
-
-    assert await store.try_take_idle("pool") == "fast"
-    assert await store.try_take_idle("pool") is None
-    assert discarded == ["late"]
+    assert called.is_set()
 
 
 @pytest.mark.asyncio
@@ -350,6 +270,7 @@ async def test_async_acquire_fail_fast_stale_idle_raises_and_kills_candidate() -
             await pool.acquire(policy=AcquirePolicy.FAIL_FAST)
         assert exc.value.error.code == "POOL_ACQUIRE_FAILED"
         assert (await store.snapshot_counters("pool")).idle_count == 0
+
         # Kill is now fire-and-forget (retry-loop must not block on slow DELETE) so wait for
         # the background task to observe the kill.
         async def _killed_stale_1() -> bool:
@@ -376,7 +297,9 @@ async def test_async_acquire_direct_create_when_empty() -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_acquire_does_not_direct_create_when_pool_namespace_is_destroying() -> None:
+async def test_async_acquire_does_not_direct_create_when_pool_namespace_is_destroying() -> (
+    None
+):
     FakeAsyncSandbox.reset()
     store = InMemoryAsyncPoolStateStore()
     pool = _create_pool(max_idle=0, store=store)
@@ -441,7 +364,9 @@ async def test_async_acquire_stopped_destroyed_pool_raises_pool_destroyed() -> N
 
 
 @pytest.mark.asyncio
-async def test_async_acquire_destroy_race_preserves_pool_destroyed_when_cleanup_fails() -> None:
+async def test_async_acquire_destroy_race_preserves_pool_destroyed_when_cleanup_fails() -> (
+    None
+):
     store = InMemoryAsyncPoolStateStore()
     await store.put_idle("pool", "id-1")
 
@@ -523,6 +448,114 @@ async def test_async_acquire_direct_create_kills_and_closes_when_renew_fails() -
         assert FakeAsyncSandbox.last_created.closed
     finally:
         FakeAsyncSandbox.fail_renew = False
+        await pool.shutdown(False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["idle", "direct", "creator"])
+@pytest.mark.parametrize("phase", ["renew", "fence"])
+async def test_acquire_cancellation_finishes_owned_sandbox_cleanup(
+    source: str,
+    phase: str,
+) -> None:
+    entered = asyncio.Event()
+    kill_started = asyncio.Event()
+    finish_kill = asyncio.Event()
+    never = asyncio.Event()
+
+    class BlockingSandbox(FakeAsyncSandbox):
+        def __init__(self) -> None:
+            super().__init__("owned-sandbox")
+            self.client = httpx.AsyncClient()
+
+        async def renew(self, timeout: timedelta) -> None:
+            if phase == "renew":
+                entered.set()
+                await never.wait()
+
+        async def kill(self) -> None:
+            kill_started.set()
+            await finish_kill.wait()
+            self.killed = True
+
+        async def close(self) -> None:
+            await self.client.aclose()
+            self.closed = True
+
+    sandbox = BlockingSandbox()
+
+    class BlockingStore(InMemoryAsyncPoolStateStore):
+        async def get_destroy_state(self, pool_name: str) -> Any:
+            if phase == "fence" and returned_sandbox:
+                entered.set()
+                await never.wait()
+            return await super().get_destroy_state(pool_name)
+
+    returned_sandbox = False
+
+    async def provide(*args: Any, **kwargs: Any) -> BlockingSandbox:
+        nonlocal returned_sandbox
+        returned_sandbox = True
+        return sandbox
+
+    class Factory:
+        create = staticmethod(provide)
+        connect = staticmethod(provide)
+
+    store = BlockingStore()
+    pool = SandboxPoolAsync(
+        pool_name="pool",
+        max_idle=0,
+        state_store=store,
+        connection_config=ConnectionConfig(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        sandbox_creator=provide if source == "creator" else None,
+        sandbox_factory=Factory,  # type: ignore[arg-type]
+        sandbox_manager_factory=lambda config: _manager_factory(FakeAsyncManager()),
+    )
+    await pool.start()
+    if source == "idle":
+        await store.put_idle("pool", sandbox.id)
+    acquisition = asyncio.create_task(
+        pool.acquire(sandbox_timeout=timedelta(minutes=5))
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        acquisition.cancel()
+        await asyncio.wait_for(kill_started.wait(), timeout=2)
+        acquisition.cancel()
+        finish_kill.set()
+        with pytest.raises(asyncio.CancelledError):
+            await acquisition
+        assert sandbox.killed
+        assert sandbox.client.is_closed
+        assert (await store.snapshot_counters("pool")).idle_count == 0
+    finally:
+        returned_sandbox = False
+        finish_kill.set()
+        acquisition.cancel()
+        await asyncio.gather(acquisition, return_exceptions=True)
+        await sandbox.client.aclose()
+        await pool.shutdown(False)
+
+
+@pytest.mark.asyncio
+async def test_async_direct_create_failure_after_run_retired_is_pool_not_running() -> (
+    None
+):
+    pool = _create_pool(max_idle=0)
+    await pool.start()
+
+    async def fail_after_retire(*args: Any, **kwargs: Any) -> FakeAsyncSandbox:
+        pool._lifecycle_state = PoolLifecycleState.STOPPED
+        raise RuntimeError("transport closed during shutdown")
+
+    pool._direct_create = fail_after_retire  # type: ignore[method-assign]
+    try:
+        with pytest.raises(PoolNotRunningException) as raised:
+            await pool.acquire()
+        assert isinstance(raised.value.__cause__, RuntimeError)
+    finally:
         await pool.shutdown(False)
 
 
@@ -622,7 +655,6 @@ async def test_async_resize_only_updates_target_without_immediate_reconcile_trig
         state_store=InMemoryAsyncPoolStateStore(),
         connection_config=ConnectionConfig(),
         creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
-        reconcile_interval=timedelta(seconds=10),
         sandbox_manager_factory=lambda config: _manager_factory(FakeAsyncManager()),
         sandbox_factory=FakeAsyncSandbox,  # type: ignore[arg-type]
     )
@@ -662,7 +694,6 @@ async def test_async_graceful_shutdown_waits_for_running_warmup_before_stop() ->
         state_store=InMemoryAsyncPoolStateStore(),
         connection_config=ConnectionConfig(),
         creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
-        reconcile_interval=timedelta(milliseconds=20),
         primary_lock_ttl=timedelta(seconds=5),
         drain_timeout=timedelta(milliseconds=50),
         warmup_sandbox_preparer=blocking_preparer,  # type: ignore[arg-type]
@@ -747,6 +778,291 @@ async def test_async_user_managed_transport_is_preserved_for_pool_resources() ->
         await pool.shutdown(False)
 
 
+@pytest.mark.asyncio
+async def test_async_default_warmup_owns_transport_while_manager_uses_shared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager_configs: list[ConnectionConfig] = []
+    sandbox_configs: list[ConnectionConfig] = []
+    transport_limits: dict[str, object] = {}
+    original_with_transport = ConnectionConfig.with_transport_if_missing
+
+    def capture_transport_limits(
+        config: ConnectionConfig, **kwargs: object
+    ) -> ConnectionConfig:
+        transport_limits.update(kwargs)
+        return original_with_transport(config, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        ConnectionConfig, "with_transport_if_missing", capture_transport_limits
+    )
+
+    class CapturingAsyncSandbox(FakeAsyncSandbox):
+        @classmethod
+        async def create(cls, *args: Any, **kwargs: Any) -> CapturingAsyncSandbox:
+            sandbox_configs.append(kwargs["connection_config"])
+            return cls("created-with-shared-transport")
+
+    async def manager_factory(config: ConnectionConfig) -> FakeAsyncManager:
+        manager_configs.append(config)
+        return FakeAsyncManager()
+
+    pool = SandboxPoolAsync(
+        pool_name="pool",
+        owner_id="owner-1",
+        max_idle=1,
+        state_store=InMemoryAsyncPoolStateStore(),
+        connection_config=ConnectionConfig(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        sandbox_manager_factory=manager_factory,  # type: ignore[arg-type]
+        sandbox_factory=CapturingAsyncSandbox,  # type: ignore[arg-type]
+    )
+    await pool.start()
+    try:
+        await _eventually(lambda: _idle_count_equals(pool, 1))
+        assert manager_configs[0].transport is not None
+        assert transport_limits["max_connections"] is None
+        assert transport_limits["max_keepalive_connections"] == 128
+        assert sandbox_configs[0].transport is None
+        assert manager_configs[0]._owns_transport
+        assert sandbox_configs[0]._owns_transport
+        assert sandbox_configs[0].retry_policy.max_retries == 0
+        another_warmup_config = pool._connection_for_warmup_create()
+        assert another_warmup_config is not sandbox_configs[0]
+        assert another_warmup_config.transport is None
+        assert another_warmup_config._owns_transport
+    finally:
+        await pool.shutdown(False)
+
+
+async def test_async_staged_warmup_runs_in_order() -> None:
+    events: list[str] = []
+
+    class StagedSandbox(FakeAsyncSandbox):
+        @classmethod
+        async def create(cls, *args: Any, **kwargs: Any) -> StagedSandbox:
+            assert kwargs["skip_health_check"] is True
+            events.append("create")
+            return cls("staged-1")
+
+        async def is_healthy(self) -> bool:
+            events.append("readiness")
+            return True
+
+        async def renew(self, timeout: timedelta) -> None:
+            events.append("renew")
+            await super().renew(timeout)
+
+    async def prepare(sandbox: FakeAsyncSandbox) -> None:
+        events.append("prepare")
+
+    async def post_prepare(sandbox: FakeAsyncSandbox) -> bool:
+        events.append("post-prepare")
+        return True
+
+    async def manager_factory(config: ConnectionConfig) -> FakeAsyncManager:
+        return FakeAsyncManager()
+
+    pool = SandboxPoolAsync(
+        pool_name="staged",
+        max_idle=1,
+        warmup_create_qps=1,
+        warmup_concurrency=1,
+        state_store=InMemoryAsyncPoolStateStore(),
+        connection_config=ConnectionConfig(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        warmup_sandbox_preparer=prepare,  # type: ignore[arg-type]
+        warmup_post_prepare_health_check=post_prepare,  # type: ignore[arg-type]
+        sandbox_manager_factory=manager_factory,  # type: ignore[arg-type]
+        sandbox_factory=StagedSandbox,  # type: ignore[arg-type]
+    )
+    await pool.start()
+    try:
+        await _eventually(lambda: _idle_count_equals(pool, 1))
+        assert events[:5] == [
+            "create",
+            "readiness",
+            "prepare",
+            "post-prepare",
+            "renew",
+        ]
+    finally:
+        await pool.shutdown(False)
+
+
+async def test_async_warmup_polling_delay_does_not_hold_concurrency_slot() -> None:
+    created = 0
+    attempts: dict[str, int] = {}
+    first_round: list[str] = []
+
+    class PollingSandbox(FakeAsyncSandbox):
+        @classmethod
+        async def create(cls, *args: Any, **kwargs: Any) -> PollingSandbox:
+            nonlocal created
+            created += 1
+            return cls(f"polling-{created}")
+
+    async def health(sandbox: FakeAsyncSandbox) -> bool:
+        attempts[sandbox.id] = attempts.get(sandbox.id, 0) + 1
+        if attempts[sandbox.id] == 1:
+            first_round.append(sandbox.id)
+        return attempts[sandbox.id] >= 2
+
+    async def manager_factory(config: ConnectionConfig) -> FakeAsyncManager:
+        return FakeAsyncManager()
+
+    pool = SandboxPoolAsync(
+        pool_name="polling-slots",
+        max_idle=2,
+        warmup_create_qps=2,
+        warmup_concurrency=1,
+        state_store=InMemoryAsyncPoolStateStore(),
+        connection_config=ConnectionConfig(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        warmup_health_check=health,  # type: ignore[arg-type]
+        warmup_health_check_polling_interval=timedelta(milliseconds=100),
+        sandbox_manager_factory=manager_factory,  # type: ignore[arg-type]
+        sandbox_factory=PollingSandbox,  # type: ignore[arg-type]
+    )
+    await pool.start()
+    try:
+        await _eventually(lambda: _idle_count_equals(pool, 2))
+        assert len(set(first_round[:2])) == 2
+    finally:
+        await pool.shutdown(False)
+
+
+async def test_async_primary_heartbeat_continues_while_preparer_is_blocked() -> None:
+    class CountingStore(InMemoryAsyncPoolStateStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.renew_calls = 0
+
+        async def renew_primary_lock(
+            self, pool_name: str, owner_id: str, ttl: timedelta
+        ) -> bool:
+            self.renew_calls += 1
+            return await super().renew_primary_lock(pool_name, owner_id, ttl)
+
+    store = CountingStore()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def prepare(sandbox: FakeAsyncSandbox) -> None:
+        entered.set()
+        await release.wait()
+
+    async def manager_factory(config: ConnectionConfig) -> FakeAsyncManager:
+        return FakeAsyncManager()
+
+    pool = SandboxPoolAsync(
+        pool_name="heartbeat",
+        owner_id="owner-1",
+        max_idle=1,
+        state_store=store,
+        connection_config=ConnectionConfig(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        primary_lock_ttl=timedelta(milliseconds=90),
+        warmup_sandbox_preparer=prepare,  # type: ignore[arg-type]
+        sandbox_manager_factory=manager_factory,  # type: ignore[arg-type]
+        sandbox_factory=FakeAsyncSandbox,  # type: ignore[arg-type]
+    )
+    await pool.start()
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        await asyncio.sleep(0.2)
+        assert store.renew_calls >= 2
+        release.set()
+        await _eventually(lambda: _idle_count_equals(pool, 1))
+    finally:
+        release.set()
+        await pool.shutdown(False)
+
+
+async def test_async_retired_acquire_cannot_consume_restarted_run_idle() -> None:
+    store = InMemoryAsyncPoolStateStore()
+    await store.put_idle("pool", "old-run")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingFactory(FakeAsyncSandbox):
+        @classmethod
+        async def connect(
+            cls, sandbox_id: str, *args: Any, **kwargs: Any
+        ) -> FakeAsyncSandbox:
+            if sandbox_id == "old-run":
+                entered.set()
+                await release.wait()
+                raise RuntimeError("old candidate failed")
+            return cls(sandbox_id)
+
+    async def manager_factory(config: ConnectionConfig) -> FakeAsyncManager:
+        return FakeAsyncManager()
+
+    pool = SandboxPoolAsync(
+        pool_name="pool",
+        owner_id="owner-1",
+        max_idle=0,
+        max_acquire_retries=2,
+        state_store=store,
+        connection_config=ConnectionConfig(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        sandbox_manager_factory=manager_factory,  # type: ignore[arg-type]
+        sandbox_factory=BlockingFactory,  # type: ignore[arg-type]
+    )
+    await pool.start()
+    acquire = asyncio.create_task(pool.acquire(policy=AcquirePolicy.RETRY_NEXT_IDLE))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    await pool.shutdown(False)
+    await pool.start()
+    await store.put_idle("pool", "new-run")
+    release.set()
+    with pytest.raises(PoolNotRunningException):
+        await asyncio.wait_for(acquire, timeout=2)
+    entries = await store.snapshot_idle_entries("pool")
+    assert entries[0].sandbox_id == "new-run"
+    await pool.shutdown(False)
+
+
+async def test_async_acquire_assertion_error_cleans_popped_idle() -> None:
+    store = InMemoryAsyncPoolStateStore()
+    await store.put_idle("pool", "broken-check")
+    manager = FakeAsyncManager()
+
+    class AssertionFactory(FakeAsyncSandbox):
+        @classmethod
+        async def connect(
+            cls, sandbox_id: str, *args: Any, **kwargs: Any
+        ) -> FakeAsyncSandbox:
+            raise AssertionError("user health check failed")
+
+    async def manager_factory(config: ConnectionConfig) -> FakeAsyncManager:
+        return manager
+
+    pool = SandboxPoolAsync(
+        pool_name="pool",
+        owner_id="owner-1",
+        max_idle=0,
+        state_store=store,
+        connection_config=ConnectionConfig(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        sandbox_manager_factory=manager_factory,  # type: ignore[arg-type]
+        sandbox_factory=AssertionFactory,  # type: ignore[arg-type]
+    )
+    await pool.start()
+    try:
+        with pytest.raises(AssertionError, match="user health check failed"):
+            await pool.acquire(policy=AcquirePolicy.FAIL_FAST)
+
+        async def killed() -> bool:
+            return manager.killed == ["broken-check"]
+
+        await _eventually(killed)
+        assert (await store.snapshot_counters("pool")).idle_count == 0
+    finally:
+        await pool.shutdown(False)
+
+
 def _create_pool(
     *,
     max_idle: int,
@@ -762,7 +1078,6 @@ def _create_pool(
         state_store=store or InMemoryAsyncPoolStateStore(),
         connection_config=ConnectionConfig(),
         creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
-        reconcile_interval=timedelta(milliseconds=20),
         primary_lock_ttl=timedelta(seconds=5),
         drain_timeout=timedelta(milliseconds=50),
         max_acquire_retries=max_acquire_retries,
@@ -784,14 +1099,14 @@ async def test_async_acquire_retry_next_idle_empty_raises_pool_empty() -> None:
         await pool.shutdown(False)
 
 
-async def test_async_acquire_retry_next_idle_all_stale_bounds_retries_and_raises() -> None:
+async def test_async_acquire_retry_next_idle_all_stale_bounds_retries_and_raises() -> (
+    None
+):
     store = InMemoryAsyncPoolStateStore()
     manager = FakeAsyncManager()
     for i in range(5):
         await store.put_idle("pool", f"stale-{i}")
-    pool = _create_pool(
-        max_idle=0, store=store, manager=manager, max_acquire_retries=3
-    )
+    pool = _create_pool(max_idle=0, store=store, manager=manager, max_acquire_retries=3)
     await pool.start()
     try:
         with pytest.raises(PoolAcquireFailedException):
@@ -906,7 +1221,6 @@ async def test_async_acquire_retry_next_idle_renew_failure_kills_remote_without_
         state_store=store,
         connection_config=ConnectionConfig(),
         creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
-        reconcile_interval=timedelta(milliseconds=20),
         primary_lock_ttl=timedelta(seconds=5),
         drain_timeout=timedelta(milliseconds=50),
         max_acquire_retries=5,
@@ -933,7 +1247,9 @@ async def test_async_acquire_retry_next_idle_renew_failure_kills_remote_without_
         await pool.shutdown(False)
 
 
-async def test_async_acquire_retry_next_idle_does_not_block_on_slow_stale_kill() -> None:
+async def test_async_acquire_retry_next_idle_does_not_block_on_slow_stale_kill() -> (
+    None
+):
     """Async counterpart of the sync slow-kill regression: stale-candidate kill must be
     scheduled as a background task so a slow DELETE does not stall the retry loop.
     """
@@ -950,9 +1266,7 @@ async def test_async_acquire_retry_next_idle_does_not_block_on_slow_stale_kill()
     await store.put_idle("pool", "healthy-x")
 
     manager = SlowKillManager()
-    pool = _create_pool(
-        max_idle=0, store=store, manager=manager, max_acquire_retries=5
-    )
+    pool = _create_pool(max_idle=0, store=store, manager=manager, max_acquire_retries=5)
     await pool.start()
     try:
         start = time.monotonic()
@@ -1215,6 +1529,9 @@ class FakeAsyncSandbox:
         if self.fail_renew:
             raise RuntimeError("renew failed")
         self.renewed.append(timeout)
+
+    async def is_healthy(self) -> bool:
+        return True
 
     async def kill(self) -> None:
         self.killed = True

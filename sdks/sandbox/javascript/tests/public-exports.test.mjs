@@ -49,7 +49,9 @@ test("public package exports client-side pool APIs", async () => {
   assert.equal(typeof sdk.AcquirePolicy, "object");
   assert.equal(sdk.AcquirePolicy.DIRECT_CREATE, "DIRECT_CREATE");
   assert.equal(sdk.PoolLifecycleState.RUNNING, "RUNNING");
-  assert.equal(sdk.PoolHealthState.HEALTHY, "HEALTHY");
+  assert.equal(sdk.PoolState.HEALTHY, "HEALTHY");
+  assert.equal(sdk.PoolDestroyState.ACTIVE, "ACTIVE");
+  assert.equal(typeof sdk.SandboxPoolManager, "function");
   assert.equal(sdk.PooledSandboxCreateReason.WARMUP, "WARMUP");
   const exportedNames = exportedDeclarationNames(declarations);
   assert.equal(exportedNames.has("SandboxPoolOptions"), true);

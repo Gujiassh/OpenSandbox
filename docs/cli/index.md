@@ -19,19 +19,21 @@ It uses the OpenSandbox Python SDK under the hood and is intended to be the shor
 
 ## Install
 
-Choose one:
+::: code-group
 
-```bash
+```bash [pip]
 pip install opensandbox-cli
 ```
 
-```bash
+```bash [uv]
 uv tool install opensandbox-cli
 ```
 
-```bash
+```bash [pipx]
 pipx install opensandbox-cli
 ```
+
+:::
 
 Confirm the install:
 
@@ -94,14 +96,14 @@ osb sandbox health <sandbox-id> -o json
 Use `--` before the sandbox command payload.
 
 ```bash
-osb command run <sandbox-id> -o raw -- python -c "print(1 + 1)"
+osb command run <sandbox-id> -o raw --argv -- python -c "print(1 + 1)"
 ```
 
 ### 5. Read or write a file
 
 ```bash
-osb file write <sandbox-id> /workspace/hello.txt -c "hello" -o json
-osb file cat <sandbox-id> /workspace/hello.txt -o raw
+osb file write <sandbox-id> /tmp/hello.txt -c "hello" -o json
+osb file cat <sandbox-id> /tmp/hello.txt -o raw
 ```
 
 ### 6. Clean up
@@ -171,11 +173,28 @@ osb sandbox metrics <sandbox-id>
 osb sandbox metrics <sandbox-id> --watch -o raw
 ```
 
+### Pause, resume, and renew
+
+```bash
+osb sandbox pause <sandbox-id> -o json
+osb sandbox get <sandbox-id> -o json
+# Repeat get with a deadline until status.state is Paused; stop on Failed.
+# Only then resume:
+osb sandbox resume <sandbox-id> --resume-timeout 60s -o json
+osb sandbox renew <sandbox-id> --timeout 30m -o json
+```
+
+Pause is asynchronous. A successful pause response means the request was accepted.
+See [Pause and Resume](/guides/pause-resume) for runtime-specific behavior.
+
 ### Expose a service
 
 ```bash
 osb sandbox endpoint <sandbox-id> --port 8080 -o json
 ```
+
+Use the returned endpoint and headers together. The command resolves a route;
+it does not start a service or prove that the application is healthy.
 
 ### Run commands
 
@@ -192,6 +211,25 @@ osb command run <sandbox-id> --background -o json -- sh -c "sleep 10; echo done"
 osb command status <sandbox-id> <execution-id> -o json
 osb command logs <sandbox-id> <execution-id> -o json
 ```
+
+By default the CLI shell-quotes each argument and joins them into a command
+string. To use pipelines, redirection, or sandbox-side variable expansion, pass
+an explicit shell and script:
+
+```bash
+osb command run <sandbox-id> -o raw -- sh -c 'echo "$HOME"; printf "ready\n" | cat'
+```
+
+Use `--argv` for native execution without a shell. It requires execd support for
+the `argv` request field:
+
+```bash
+osb command run <sandbox-id> -o raw --argv -- python3 -c "import sys; print(sys.argv[1:])" "a b" '$HOME' "x'y" ""
+osb command interrupt <sandbox-id> <execution-id> -o json
+```
+
+Foreground `command run` accepts `-o raw`; background execution accepts
+`table`, `json`, or `yaml`.
 
 Persistent shell session:
 
@@ -213,6 +251,20 @@ osb file info <sandbox-id> /workspace/main.py -o json
 osb file replace <sandbox-id> /workspace/app.py --old old --new new -o json
 osb file chmod <sandbox-id> /workspace/script.sh --mode 755 -o json
 ```
+
+For regular files, `file download` replaces the local destination only after the entire download
+succeeds. If the download fails or you interrupt it, an existing file stays
+unchanged and temporary download files are removed. The destination directory
+must be writable so the CLI can stage the download before replacing the file.
+
+Existing devices (such as `/dev/null`) and named pipes receive the download
+directly. They are not replaced, and bytes already written cannot be rolled back
+if the download fails or is interrupted.
+
+Destinations that refer to standard output, such as `/dev/stdout` and `/dev/fd/1`,
+stream directly even when stdout is redirected to a regular file. These downloads
+omit the success message in all output formats so stdout contains only file bytes;
+errors still go to stderr. A failed or interrupted stream can contain partial data.
 
 ### Manage runtime egress policy
 
@@ -238,7 +290,8 @@ osb command run <sandbox-id> -o raw -- curl -I https://pypi.org
 
 Credential Vault operations call the sandbox egress sidecar through the Python SDK.
 Create the sandbox with `--credential-proxy` and an explicit network policy before
-writing vault state.
+writing vault state. Template-backed sandboxes do not support Credential Vault.
+See [Credential Vault](/guides/credential-vault) for payload examples and revision checks.
 
 ```bash
 osb credential-vault create <sandbox-id> --file vault.yaml -o json
@@ -267,12 +320,15 @@ osb diagnostics logs <sandbox-id> --scope container -o yaml
 ```
 
 `--scope` is required for stable diagnostics. The built-in server supports
-`container` and `all` for logs, and `runtime` and `all` for events. It returns
+`container` and `all` for logs, and `runtime` and `all` for events. Docker/Kubernetes return
 `DIAGNOSTICS_SCOPE_UNSUPPORTED` for unavailable scopes, including lifecycle events.
 Best-effort scopes may include a `warnings` field when the backend can only
 provide a subset. Raw output prints inline
 diagnostic text, or the content URL when diagnostics are delivered as a
-temporary URL. Older server builds may still return
+temporary URL; raw output does not download that URL. JSON/YAML use Python
+model names such as `content_url`, `content_type`, and `expires_at` (the HTTP API
+uses camelCase). See [Diagnostics](/api/#diagnostics) for runtime differences.
+Older server builds may still return
 `DIAGNOSTICS_NOT_IMPLEMENTED` for scoped diagnostics.
 
 ::: info
@@ -311,10 +367,15 @@ The main command groups are:
 - `osb command`: command execution and persistent sessions
 - `osb file`: file and directory operations
 - `osb egress`: runtime egress policy
+- `osb credential-vault`: sandbox-local credentials and bindings
 - `osb diagnostics`: stable diagnostics logs and events
 - `osb devops`: experimental legacy diagnostics
 - `osb config`: local CLI configuration
 - `osb skills`: bundled skills for AI tools
+
+The CLI currently exposes image-backed creation. It does not provide snapshot or
+template management, Client Pool, or pool tracing commands; use the SDK/API for
+those workflows. A feature in the Python SDK is not automatically a CLI command.
 
 Explore them directly:
 

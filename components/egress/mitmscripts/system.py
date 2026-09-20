@@ -48,6 +48,8 @@
 #      Pass-through is skipped when ssl_insecure is enabled, keeping the
 #      explicit insecure-MITM escape hatch working for no-SNI clients.
 #      TCP-layer enforcement (deny/allow rules) still applies to these flows.
+#   5. Owns the authenticated revision receiver only when the Go launcher hands
+#      off a complete per-process internal session. The default remains disabled.
 #
 # User-defined addons can be loaded alongside this script via
 # OPENSANDBOX_EGRESS_MITMPROXY_SCRIPT (comma-separated for multiple scripts).
@@ -60,7 +62,7 @@ import os
 import re
 import socket
 from contextlib import suppress
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import quote, quote_plus, unquote
 
 from mitmproxy import ctx, http
@@ -107,6 +109,14 @@ ACTIVE_VAULT_HEADER_RESERVED_NAMES = {
 _ACTIVE_VAULT_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$")
 _ACTIVE_VAULT_HOST_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _PERCENT_ESCAPE_RE = re.compile(r"%([0-9A-Fa-f]{2})")
+_REVISION_RUNTIME_ERROR = "credential proxy: invalid revision runtime configuration"
+_REVISION_ENV = {
+    "socket": "OPENSANDBOX_EGRESS_REVISION_IPC_SOCKET",
+    "token": "OPENSANDBOX_EGRESS_REVISION_IPC_TOKEN",
+    "control": "OPENSANDBOX_EGRESS_REVISION_CONTROL_GENERATION",
+    "subject": "OPENSANDBOX_EGRESS_REVISION_SUBJECT_GENERATION",
+    "limit": "OPENSANDBOX_EGRESS_REVISION_MAX_SNAPSHOT_BYTES",
+}
 
 
 class ActiveVault:
@@ -128,29 +138,127 @@ class ActiveVaultLookupError(Exception):
 
 
 _vault_cache: ActiveVault | None = None
+_revision_receiver: Any | None = None
+_revision_server: Any | None = None
 
-# Fleet profile: one shared mitmdump serving N sandboxes; the active vault is
+# Operator-only diagnostics; no public interception mode is enabled here.
+_tls_shadow_enabled = os.environ.get(
+    "OPENSANDBOX_EGRESS_MITMPROXY_SHADOW", ""
+).strip().lower() in {"1", "true", "on"}
+
+# Fast Sandbox profile: one shared mitmdump serving N sandboxes; the active vault is
 # selected by the client's source IP (preserved by the interception DNAT), so
 # the immutable snapshot cache is keyed per client IP. Every flow performs a
 # conditional snapshot-tag check; the full secret-bearing snapshot is transferred
 # only when its opaque tag changes. The sidecar profile keeps one shared cache.
 # The per-IP cache is bounded because spoofed source IPs could otherwise grow
 # it without limit.
-_fleet_mode_enabled = False
+_fast_sandbox_mode_enabled = False
 _vault_cache_by_ip: dict[str, ActiveVault] = {}
 _VAULT_CACHE_MAX_IPS = 4096
 
 
-def _set_fleet_mode(enabled: bool) -> None:
-    global _fleet_mode_enabled
-    _fleet_mode_enabled = enabled
+def _set_fast_sandbox_mode(enabled: bool) -> None:
+    global _fast_sandbox_mode_enabled
+    _fast_sandbox_mode_enabled = enabled
 
 
-def _set_fleet_mode_from_env() -> None:
-    _set_fleet_mode(os.environ.get("OPENSANDBOX_EGRESS_PROFILE", "").strip().lower() == "fleet")
+def _set_fast_sandbox_mode_from_env() -> None:
+    _set_fast_sandbox_mode(
+        os.environ.get("OPENSANDBOX_EGRESS_PROFILE", "").strip().lower() == "fast-sandbox"
+    )
 
 
-_set_fleet_mode_from_env()
+_set_fast_sandbox_mode_from_env()
+
+
+def _fatal_revision_runtime() -> NoReturn:
+    # mitmproxy 11 loads -s scripts in a reload watcher. Generic exceptions are
+    # swallowed and OptionsError only stops that watcher, so SystemExit is the
+    # process-level fence that prevents a listener without the system addon.
+    raise SystemExit(_REVISION_RUNTIME_ERROR) from None
+
+
+def _revision_configuration() -> tuple[str, str, str, str, int] | None:
+    present = {key for key, name in _REVISION_ENV.items() if name in os.environ}
+    if not present:
+        return None
+    if present != set(_REVISION_ENV):
+        _fatal_revision_runtime()
+    values = {key: os.environ[name] for key, name in _REVISION_ENV.items()}
+    limit_text = values["limit"]
+    if (
+        any(not value for value in values.values())
+        or not limit_text.isascii()
+        or not limit_text.isdecimal()
+    ):
+        _fatal_revision_runtime()
+    try:
+        limit = int(limit_text)
+    except ValueError:
+        _fatal_revision_runtime()
+    if limit <= 0 or limit >= 2**63 or str(limit) != limit_text:
+        _fatal_revision_runtime()
+    return (
+        values["socket"],
+        values["token"],
+        values["control"],
+        values["subject"],
+        limit,
+    )
+
+
+def load(_loader: Any) -> None:
+    """Start one generation-fenced receiver when the launcher enables it."""
+    global _revision_receiver, _revision_server
+    if _revision_receiver is not None or _revision_server is not None:
+        _fatal_revision_runtime()
+    configuration = _revision_configuration()
+    if configuration is None:
+        return
+    socket_path, token, control, subject, limit = configuration
+    receiver = server = None
+    try:
+        from decision_snapshot import validate
+        from revision_ipc import Receiver, Server
+
+        receiver = Receiver(
+            control,
+            subject,
+            validate,
+            max_snapshot_bytes=limit,
+        )
+        server = Server(
+            receiver,
+            socket_path,
+            token,
+            max_snapshot_bytes=limit,
+            request_timeout=1,
+        )
+        server.start()
+    except Exception:  # noqa: BLE001 - configuration may contain credentials
+        if server is not None:
+            with suppress(Exception):
+                server.close()
+        elif receiver is not None:
+            with suppress(Exception):
+                receiver.close()
+        _fatal_revision_runtime()
+    _revision_receiver = receiver
+    _revision_server = server
+
+
+def done() -> None:
+    """Fence the receiver and remove only its owned socket during addon exit."""
+    global _revision_receiver, _revision_server
+    server = _revision_server
+    _revision_receiver = None
+    _revision_server = None
+    if server is not None:
+        try:
+            server.close()
+        except Exception:  # noqa: BLE001 - never expose session-bearing details
+            ctx.log.warn("credential proxy: revision runtime cleanup failed")
 
 
 class UnixSocketHTTPConnection(http_client.HTTPConnection):
@@ -203,7 +311,7 @@ def tls_clienthello(data: ClientHelloData) -> None:
 
 
 def _load_active_vault(client_ip: str | None = None) -> ActiveVault | None:
-    if _fleet_mode_enabled:
+    if _fast_sandbox_mode_enabled:
         return _load_active_vault_for_ip(client_ip)
     return _load_active_vault_shared()
 
@@ -223,7 +331,7 @@ def _load_active_vault_shared() -> ActiveVault | None:
 
 def _load_active_vault_for_ip(client_ip: str | None) -> ActiveVault | None:
     if not client_ip:
-        raise ActiveVaultLookupError("fleet vault lookup requires a client IP")
+        raise ActiveVaultLookupError("fast-sandbox vault lookup requires a client IP")
     if client_ip not in _vault_cache_by_ip and len(_vault_cache_by_ip) >= _VAULT_CACHE_MAX_IPS:
         _vault_cache_by_ip.clear()
     cached = _vault_cache_by_ip.get(client_ip)
@@ -249,7 +357,7 @@ def _fetch_active_vault(
     )
     path = ACTIVE_VAULT_PATH
     if client_ip:
-        # fleet profile: one shared socket, dispatch inside — the handler
+        # fast-sandbox profile: one shared socket, dispatch inside — the handler
         # resolves clientIp -> subject -> that subject's vault snapshot
         path = f"{ACTIVE_VAULT_PATH}?clientIp={quote(client_ip)}"
     connection = UnixSocketHTTPConnection(socket_path, timeout=0.25)
@@ -1001,6 +1109,30 @@ def _flow_client_ip(flow: http.HTTPFlow) -> str | None:
         return None
 
 
+def _observe_tls_shadow(
+    flow: http.HTTPFlow, vault: ActiveVault | None, *, lookup_failed: bool = False
+) -> None:
+    if not _tls_shadow_enabled:
+        return
+    try:
+        if flow.request.scheme != "https" or flow.request.port != 443:
+            return
+        from tls_shadow import project
+
+        sni = getattr(getattr(flow, "client_conn", None), "sni", None)
+        outcome = project(
+            sni, None if vault is None else vault.bindings, lookup_failed=lookup_failed
+        )
+        if _fast_sandbox_mode_enabled and vault is None and not lookup_failed:
+            # Fast Sandbox 404 also means unknown source identity, not just no vault.
+            outcome = "unknown_subject_or_vault"
+        # Fixed vocabulary only: no hostname, revision, subject, path, or secret.
+        ctx.log.warn("credential proxy: tls-shadow " + outcome)
+    except Exception:  # noqa: BLE001 - diagnostics must never change traffic
+        with suppress(Exception):
+            ctx.log.warn("credential proxy: tls-shadow observer_error")
+
+
 def requestheaders(flow: http.HTTPFlow) -> None:
     """Credential proxy phase 1: binding match and request metadata rewrite.
 
@@ -1011,6 +1143,7 @@ def requestheaders(flow: http.HTTPFlow) -> None:
     try:
         vault = _load_active_vault(_flow_client_ip(flow))
     except ActiveVaultLookupError as exc:
+        _observe_tls_shadow(flow, None, lookup_failed=True)
         ctx.log.warn(f"credential proxy: {exc}; request denied")
         _reject_request(
             flow,
@@ -1018,6 +1151,7 @@ def requestheaders(flow: http.HTTPFlow) -> None:
             status_code=503,
         )
         return
+    _observe_tls_shadow(flow, vault)
     if vault is None:
         return
 

@@ -37,7 +37,7 @@ OpenSandbox uses these signing paths:
   Maven publish signing configuration. Download the `.asc` signature next to
   the Maven artifact and verify it with OpenPGP tooling.
 
-Release tags may also be signed with `scripts/release/create-release.sh
+Release tags may also be signed with `manifests/release/create-release.sh
 --sign-tag` when the release operator has a local git signing key configured.
 Do not rely on signed tags alone for generated deliverables; verify the
 artifact you are installing.
@@ -55,7 +55,15 @@ Expected identity values:
 
 - Repository: `opensandbox-group/OpenSandbox`
 - OIDC issuer: `https://token.actions.githubusercontent.com`
-- Source release workflow: `opensandbox-group/OpenSandbox/.github/workflows/release-generic.yml`
+
+::: warning Legacy workflow identities (pre-umbrella releases only)
+The per-target publish workflows below were removed when OpenSandbox
+moved to unified umbrella releases. They remain the verification
+identity for artifacts published before that point. New umbrella
+releases are produced by `release-umbrella.yml` and
+`release-packages.yml`.
+:::
+
 - Component image workflow: `opensandbox-group/OpenSandbox/.github/workflows/publish-components.yml`
 - Server image workflow: `opensandbox-group/OpenSandbox/.github/workflows/publish-server.yml`
 - CLI package workflow: `opensandbox-group/OpenSandbox/.github/workflows/publish-cli.yml`
@@ -151,9 +159,16 @@ three official registries:
 | GitHub Container Registry | `ghcr.io/opensandbox-group/opensandbox/<component>` |
 | Alibaba Cloud Container Registry | `sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/<component>` |
 
-The component can be `execd`, `code-interpreter`, `ingress`, `egress`,
-`controller`, `task-executor`, `image-committer`, or `nodeagent`. The server
-image uses the component name `server`.
+The component can be `execd`, `ingress`, `egress`, `controller`,
+`task-executor`, `image-committer`, or `nodeagent`. The server image uses the
+component name `server`.
+
+::: tip Code Interpreter Image Verification
+The standalone `code-interpreter` environment image is published and maintained from [opensandbox-group/sandbox-images](https://github.com/opensandbox-group/sandbox-images).
+- **Existing image releases** (such as `v1.1.0` and earlier) continue using the OpenSandbox workflow identity (`.github/workflows/publish-components.yml`).
+- **New releases** from `opensandbox-group/sandbox-images` use its `release.yml` workflow identity.
+Users and operators verifying signatures or provenance for new releases must follow the verification documentation in [opensandbox-group/sandbox-images](https://github.com/opensandbox-group/sandbox-images).
+:::
 
 ```bash
 IMAGE="docker.io/opensandbox/execd"

@@ -35,7 +35,7 @@ The server listens on the `server.host` / `server.port` values from your TOML co
 
 ## Authentication
 
-Authentication is enforced when `server.api_key` is set. All API endpoints (except `/health`, `/docs`, `/redoc`) require the `OPEN-SANDBOX-API-KEY` header:
+Authentication is enforced when `server.api_key` is set. All API endpoints (except `/health`, `/version`, `/docs`, `/redoc`, and `/openapi.json`) require the `OPEN-SANDBOX-API-KEY` header:
 
 ```bash
 curl -H "OPEN-SANDBOX-API-KEY: your-secret-api-key" http://localhost:8080/v1/sandboxes
@@ -50,8 +50,10 @@ If `server.api_key` is empty, the server runs without authentication. In non-int
 | Section | Description |
 |---------|-------------|
 | `[server]` | Host, port, API key, and general server settings |
+| `[runtime]` | Runtime selection and execd image configuration |
+| `[otel]` | OpenTelemetry export for SDK create-latency metrics |
 | `[proxy]` | Server-side sandbox proxy target selection; use host mappings when the server cannot route to sandbox IPs |
-| `[docker]` | Docker runtime: `network_mode`, `host_ip`, image registry |
+| `[docker]` | Docker runtime networking, host address, and image-pull settings |
 | `[kubernetes]` | Kubernetes runtime: `workload_provider`, `batchsandbox_template_file` |
 | `[egress]` | Egress sidecar for `networkPolicy` enforcement |
 | `[ingress]` | Ingress gateway configuration |

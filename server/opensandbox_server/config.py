@@ -358,8 +358,6 @@ class SecureAccessConfig(BaseModel):
 
 
 class GatewayRouteModeConfig(BaseModel):
-    """Routing strategy for gateway ingress exposure."""
-
     mode: Literal[
         GATEWAY_ROUTE_MODE_WILDCARD,
         GATEWAY_ROUTE_MODE_HEADER,
@@ -374,8 +372,6 @@ class GatewayRouteModeConfig(BaseModel):
 
 
 class GatewayConfig(BaseModel):
-    """Gateway mode configuration for ingress exposure."""
-
     address: str = Field(
         ...,
         description="Gateway host used to expose sandboxes (domain or IP, may include :port; scheme is not allowed).",
@@ -388,8 +384,6 @@ class GatewayConfig(BaseModel):
 
 
 class IngressConfig(BaseModel):
-    """Configuration for exposing sandbox ingress."""
-
     mode: Literal[INGRESS_MODE_DIRECT, INGRESS_MODE_GATEWAY] = Field(
         default=INGRESS_MODE_DIRECT,
         description="Ingress exposure mode (direct or gateway).",
@@ -455,8 +449,6 @@ class IngressConfig(BaseModel):
 
 
 class LogConfig(BaseModel):
-    """Logging configuration."""
-
     level: str = Field(
         default="INFO",
         description="Python logging level for the server process.",
@@ -485,7 +477,7 @@ class LogConfig(BaseModel):
         ),
     )
     file_max_bytes: int = Field(
-        default=100 * 1024 * 1024,  # 100MB
+        default=100 * 1024 * 1024,
         ge=1,
         description="Maximum size of each log file in bytes before rotation (default: 100MB).",
     )
@@ -514,8 +506,6 @@ class LogConfig(BaseModel):
 
 
 class ServerConfig(BaseModel):
-    """FastAPI server configuration."""
-
     host: str = Field(
         default="0.0.0.0",
         description="Interface bound by the lifecycle API server.",
@@ -609,8 +599,6 @@ class ServerConfig(BaseModel):
 
 
 class ProxyConfig(BaseModel):
-    """Configuration for the sandbox reverse-proxy routes."""
-
     resolve_internal: bool = Field(
         default=True,
         description=(
@@ -625,8 +613,6 @@ class ProxyConfig(BaseModel):
 
 
 class KubernetesRuntimeConfig(BaseModel):
-    """Kubernetes-specific runtime configuration."""
-
     kubeconfig_path: Optional[str] = Field(
         default=None,
         description="Absolute path to the kubeconfig file used for API authentication.",
@@ -687,7 +673,40 @@ class KubernetesRuntimeConfig(BaseModel):
     )
     namespace: Optional[str] = Field(
         default=None,
-        description="Namespace used for sandbox workloads.",
+        description=(
+            "Kubernetes / fast-sandbox namespace for workload reads and "
+            "sandbox creation when no tenant is configured. With [tenants] "
+            "enabled, each tenant maps to its own namespace."
+        ),
+    )
+    # -- fsb (fast-sandbox) backend --------------------------------------
+    # Shared with the kubernetes runtime, which also serves fsb (fsb-)
+    # sandboxes side by side; unused fields are harmless per provider.
+    fastpath_endpoint: str = Field(
+        default="fast-sandbox-fastpath.opensandbox.svc:9090",
+        description="fast-sandbox Fast-Path Server gRPC endpoint.",
+    )
+    fastpath_timeout_seconds: float = Field(
+        default=30.0,
+        ge=1.0,
+        description="Per-RPC gRPC deadline for FastPath calls.",
+    )
+    fastpath_wait_ready_seconds: float = Field(
+        default=30.0,
+        ge=1.0,
+        description="Bounded readiness wait for DataPlaneReady after Create.",
+    )
+    fastpath_resource_pool: str = Field(
+        default="default-pool",
+        description="Default fast-sandbox SandboxPool when extensions.poolRef is unset.",
+    )
+    template_s3_publish_secret: str = Field(
+        default="sandbox-oss-credentials",
+        min_length=1,
+        description=(
+            "Secret (in the platform namespace) holding the object-store "
+            "credentials referenced by server-created SandboxTemplates."
+        ),
     )
     workload_provider: Optional[str] = Field(
         default=None,
@@ -715,14 +734,6 @@ class KubernetesRuntimeConfig(BaseModel):
         gt=0,
         description="Polling interval in seconds when waiting for a sandbox to become ready after creation.",
     )
-    snapshot_create_timeout_seconds: int = Field(
-        default=15 * 60,
-        ge=1,
-        description=(
-            "Timeout in seconds to wait for a Kubernetes public snapshot to become ready. "
-            "Set this greater than the controller snapshot commit-job-timeout."
-        ),
-    )
     execd_init_resources: Optional["ExecdInitResources"] = Field(
         default=None,
         description=(
@@ -741,8 +752,6 @@ class KubernetesRuntimeConfig(BaseModel):
 
 
 class ExecdInitResources(BaseModel):
-    """Resource requests and limits for the execd init container."""
-
     limits: Optional[Dict[str, str]] = Field(
         default=None,
         description='Resource limits, e.g. {cpu = "100m", memory = "128Mi"}.',
@@ -754,8 +763,6 @@ class ExecdInitResources(BaseModel):
 
 
 class AgentSandboxRuntimeConfig(BaseModel):
-    """Agent-sandbox runtime configuration."""
-
     template_file: Optional[str] = Field(
         default=None,
         description="Path to Sandbox CR YAML template file for agent-sandbox.",
@@ -771,8 +778,6 @@ class AgentSandboxRuntimeConfig(BaseModel):
 
 
 class StorageConfig(BaseModel):
-    """Volume and storage configuration for sandbox mounts."""
-
     allowed_host_paths: list[str] = Field(
         default_factory=list,
         description=(
@@ -800,8 +805,6 @@ class StorageConfig(BaseModel):
 DEFAULT_EGRESS_DISABLE_IPV6 = True
 
 class EgressConfig(BaseModel):
-    """Egress sidecar configuration."""
-
     image: Optional[str] = Field(
         default=None,
         description="Container image for the egress sidecar (used when network policy is requested).",
@@ -905,15 +908,19 @@ class EgressConfig(BaseModel):
 
 
 class RuntimeConfig(BaseModel):
-    """Runtime selection (docker, kubernetes, fleets, etc.)."""
-
-    type: Literal["docker", "kubernetes", "fleets"] = Field(
+    type: Literal["docker", "kubernetes"] = Field(
         ...,
         description="Active sandbox runtime implementation.",
     )
     execd_image: str = Field(
         ...,
-        description="Container image that contains the execd binary for sandbox initialization.",
+        description=(
+            "Container image that contains the execd binary for sandbox "
+            "initialization. Docker/Kubernetes run it in-sandbox; the fsb "
+            "runtime injects it into SandboxTemplate golden-image builds "
+            "(the template builder bakes the runtime files into the guest "
+            "rootfs)."
+        ),
         min_length=1,
     )
     execd_run_as_init: bool = Field(
@@ -929,40 +936,7 @@ class RuntimeConfig(BaseModel):
     )
 
 
-class FleetsRuntimeConfig(BaseModel):
-    """fleets (fast-sandbox) runtime configuration (OSEP-0007, Phase 1a)."""
-
-    fastpath_endpoint: str = Field(
-        default="fast-sandbox-fastpath.opensandbox.svc:9090",
-        description="fast-sandbox Fast-Path Server gRPC endpoint.",
-    )
-    fastpath_timeout_seconds: float = Field(
-        default=30.0,
-        ge=1.0,
-        description="Per-RPC gRPC deadline for FastPath calls.",
-    )
-    wait_ready_timeout_millis: int = Field(
-        default=30000,
-        ge=1000,
-        description="Bounded readiness wait for DataPlaneReady after Create.",
-    )
-    namespace: str = Field(
-        default="default",
-        min_length=1,
-        description=(
-            "fast-sandbox namespace used when no tenant is configured. "
-            "With [tenants] enabled, each tenant maps to its own namespace."
-        ),
-    )
-    default_pool_ref: str = Field(
-        default="default-pool",
-        description="Default SandboxPool when extensions.poolRef is unset.",
-    )
-
-
 class SecureRuntimeConfig(BaseModel):
-    """Secure container runtime configuration (gVisor, Kata, Firecracker)."""
-
     type: Literal["", "gvisor", "kata", "firecracker"] = Field(
         default="",
         description=(
@@ -991,7 +965,6 @@ class SecureRuntimeConfig(BaseModel):
     @model_validator(mode="after")
     def validate_secure_runtime(self) -> "SecureRuntimeConfig":
         if self.type == "":
-            # No secure runtime configured
             if self.docker_runtime is not None or self.k8s_runtime_class is not None:
                 raise ValueError(
                     "docker_runtime and k8s_runtime_class must be omitted when secure_runtime.type is empty."
@@ -1006,7 +979,6 @@ class SecureRuntimeConfig(BaseModel):
                 )
             # Optional: also allow docker_runtime for consistency, but Firecracker won't use it
 
-        # For gVisor and Kata, at least one runtime must be specified
         if self.type in ("gvisor", "kata"):
             if self.docker_runtime is None and self.k8s_runtime_class is None:
                 raise ValueError(
@@ -1018,8 +990,6 @@ class SecureRuntimeConfig(BaseModel):
 
 
 class DockerConfig(BaseModel):
-    """Docker runtime specific settings."""
-
     network_mode: str = Field(
         default="host",
         description="Docker network mode for sandbox containers (host, bridge, or a custom user-defined network name).",
@@ -1125,8 +1095,6 @@ class DockerConfig(BaseModel):
 
 
 class PostgreSQLStoreConfig(BaseModel):
-    """PostgreSQL connection and pool settings for server persistence."""
-
     dsn: Optional[SecretStr] = Field(
         default=None,
         description=(
@@ -1154,6 +1122,14 @@ class PostgreSQLStoreConfig(BaseModel):
         gt=0,
         description="Maximum time in seconds to wait for a pooled PostgreSQL connection.",
     )
+    snapshot_recovery_interval_seconds: float = Field(
+        default=15.0,
+        gt=0,
+        description=(
+            "Interval between unfinished snapshot recovery scans when PostgreSQL is paired "
+            "with the Kubernetes runtime. This controls takeover latency, not correctness."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_pool_size(self) -> "PostgreSQLStoreConfig":
@@ -1166,8 +1142,6 @@ class PostgreSQLStoreConfig(BaseModel):
 
 
 class StoreConfig(BaseModel):
-    """Persistence backend for server-managed server resources."""
-
     type: Literal["sqlite", "postgresql"] = Field(
         default="sqlite",
         description=(
@@ -1199,8 +1173,6 @@ class StoreConfig(BaseModel):
 
 
 class TenantsConfig(BaseModel):
-    """Multi-tenant provider configuration."""
-
     provider: Literal["file", "http"] = Field(
         default="file",
         description="Tenant provider type: 'file' (tenants.toml) or 'http' (remote endpoint).",
@@ -1236,8 +1208,6 @@ class TenantsConfig(BaseModel):
 
 
 class AppConfig(BaseModel):
-    """Root application configuration model."""
-
     server: ServerConfig = Field(default_factory=ServerConfig)
     proxy: ProxyConfig = Field(
         default_factory=ProxyConfig,
@@ -1262,7 +1232,6 @@ class AppConfig(BaseModel):
     runtime: RuntimeConfig = Field(..., description="Sandbox runtime configuration.")
     kubernetes: Optional[KubernetesRuntimeConfig] = None
     agent_sandbox: Optional["AgentSandboxRuntimeConfig"] = None
-    fleets: Optional[FleetsRuntimeConfig] = None
     ingress: Optional[IngressConfig] = None
     docker: DockerConfig = Field(default_factory=DockerConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
@@ -1297,9 +1266,6 @@ class AppConfig(BaseModel):
                 raise ValueError(
                     "agent_sandbox block requires kubernetes.workload_provider = 'agent-sandbox'."
                 )
-        elif self.runtime.type == "fleets":
-            if self.fleets is None:
-                self.fleets = FleetsRuntimeConfig()
         else:
             raise ValueError(f"Unsupported runtime type '{self.runtime.type}'.")
         return self
@@ -1322,16 +1288,16 @@ def _resolve_config_path(path: str | Path | None = None) -> Path:
 def _load_toml_data(path: Path) -> dict[str, Any]:
     """Load TOML content from file, returning empty dict if file is missing."""
     if not path.exists():
-        logger.info("Config file %s not found. Using default configuration.", path)
+        logger.info(f"Config file {path} not found. Using default configuration.")
         return {}
 
     try:
         with path.open("rb") as fh:
             data = tomllib.load(fh)
-            logger.info("Loaded configuration from %s", path)
+            logger.info(f"Loaded configuration from {path}")
             return data
     except Exception as exc:  # noqa: BLE001
-        logger.error("Failed to read config file %s: %s", path, exc)
+        logger.error(f"Failed to read config file {path}: {exc}")
         raise
 
 
@@ -1396,20 +1362,7 @@ def _apply_secure_access_env_overrides(config: AppConfig) -> None:
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:
-    """
-    Load configuration from TOML file and store it globally.
-
-    Args:
-        path: Optional explicit config path. Falls back to SANDBOX_CONFIG_PATH env,
-              then ~/.sandbox.toml when not provided.
-
-    Returns:
-        AppConfig: Parsed application configuration.
-
-    Raises:
-        ValidationError: If the TOML contents do not match AppConfig schema.
-        Exception: For any IO or parsing errors.
-    """
+    """Load configuration from TOML file and store it globally."""
     global _config, _config_path
 
     resolved_path = _resolve_config_path(path)
@@ -1419,7 +1372,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     try:
         _config = AppConfig(**raw_data)
     except ValidationError as exc:
-        logger.error("Invalid configuration in %s: %s", resolved_path, exc)
+        logger.error(f"Invalid configuration in {resolved_path}: {exc}")
         raise
 
     _apply_env_overrides(_config)
@@ -1428,12 +1381,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
 
 
 def get_config() -> AppConfig:
-    """
-    Retrieve the currently loaded configuration, loading defaults if necessary.
-
-    Returns:
-        AppConfig: Currently active configuration.
-    """
+    """Retrieve the currently loaded configuration, loading defaults if necessary."""
     global _config
     if _config is None:
         _config = load_config()
@@ -1441,7 +1389,6 @@ def get_config() -> AppConfig:
 
 
 def get_config_path() -> Path:
-    """Return the resolved configuration path."""
     global _config_path
     if _config_path is None:
         _config_path = _resolve_config_path()

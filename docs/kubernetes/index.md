@@ -219,6 +219,14 @@ This project requires two separate images - one for the controller and another f
 
 You can install OpenSandbox Controller directly from GitHub Releases. Check the [Releases page](https://github.com/opensandbox-group/OpenSandbox/releases?q=helm%2Fopensandbox-controller&expanded=true) for all available versions.
 
+> The controller chart no longer bundles the CRDs. Install the base chart once
+> per cluster before the controller:
+>
+> ```sh
+> helm install base \
+>   https://github.com/opensandbox-group/OpenSandbox/releases/download/helm/base/<version>/base-<version>.tgz
+> ```
+
 ```sh
 # Replace <version> with the desired version (e.g., 0.1.0)
 helm install opensandbox-controller \
@@ -275,7 +283,8 @@ helm install opensandbox-controller \
 
 2. Install with Helm:
    ```sh
-   helm install opensandbox-controller ./charts/opensandbox-controller \
+   helm install base ../manifests/charts/base
+   helm install opensandbox-controller ../manifests/charts/controller \
      --set controller.image.repository=<some-registry>/opensandbox-controller \
      --set controller.image.tag=<tag> \
      --namespace opensandbox-system \
@@ -538,7 +547,7 @@ For a BatchSandbox with multiple replicas, `Succeed` also does not mean that eve
 | `Pausing` | A pause operation is in progress. |
 | `Paused` | The sandbox is paused and its runtime resources have been released. |
 | `Resuming` | The controller is restoring runtime resources after a pause. |
-| `Failed` | The controller detected a terminal sandbox runtime failure. A Pod in Kubernetes phase `Failed` is terminal; inspect conditions and Pod events for details. |
+| `Failed` | The controller detected a terminal sandbox runtime failure. A Pod in Kubernetes phase `Failed` is terminal; inspect conditions and Pod events for details. A Pod still in phase `Running` is also treated as terminal when its restart policy is `Never` and its main container (the first container in the Pod spec) has exited with a non-zero code — for example when a sidecar keeps the Pod running after the sandbox main process crashed. |
 
 The controller records active conditions with `status: "True"`:
 

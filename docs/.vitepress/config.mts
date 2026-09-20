@@ -1,5 +1,36 @@
 import { defineConfig } from "vitepress";
 
+const sdkSidebar = [
+  {
+    text: "Sandbox SDKs",
+    collapsed: false,
+    items: [
+      { text: "Overview", link: "/sdks/" },
+      { text: "Python", link: "/sdks/python" },
+      { text: "JavaScript", link: "/sdks/javascript" },
+      { text: "Kotlin / Java", link: "/sdks/kotlin" },
+      { text: "Go", link: "/sdks/go" },
+      { text: "C#", link: "/sdks/csharp" },
+    ],
+  },
+  {
+    text: "SDK Features",
+    items: [
+      { text: "Client Pool", link: "/guides/client-pool" },
+      { text: "Observability", link: "/sdks/observability" },
+    ],
+  },
+  {
+    text: "CLI",
+    items: [{ text: "CLI Reference", link: "/cli/" }],
+  },
+  {
+    text: "MCP",
+    collapsed: false,
+    items: [{ text: "MCP Server", link: "/sdks/mcp" }],
+  },
+];
+
 export default defineConfig({
   title: "OpenSandbox",
   description: "Universal Sandbox Infrastructure for AI Applications",
@@ -7,7 +38,9 @@ export default defineConfig({
   lastUpdated: true,
   base: process.env.DOCS_BASE || "/",
   ignoreDeadLinks: [/^https?:\/\/localhost/],
-  srcExclude: ["README.md"],
+  // Release notes (docs/releases/*) are GitHub Release bodies referenced
+  // verbatim by the umbrella release workflow — not docs-site pages.
+  srcExclude: ["README.md", "releases/**"],
 
   head: [
     ["link", { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" }],
@@ -30,13 +63,12 @@ export default defineConfig({
 
     nav: [
       { text: "Getting Started", link: "/getting-started/" },
-      { text: "Guides", link: "/guides/credential-vault" },
+      { text: "Guides", link: "/guides/" },
       {
         text: "Reference",
         items: [
           { text: "SDKs", link: "/sdks/" },
           { text: "API Specs", link: "/api/" },
-          { text: "CLI", link: "/cli/" },
           { text: "Components", link: "/components/" },
           { text: "Kubernetes", link: "/kubernetes/" },
           { text: "Migration Guides", link: "/reference/execd-path-migration" },
@@ -63,7 +95,7 @@ export default defineConfig({
           text: "Next Steps",
           items: [
             { text: "Architecture", link: "/architecture/" },
-            { text: "Guides", link: "/guides/credential-vault" },
+            { text: "Guides", link: "/guides/" },
             { text: "SDKs", link: "/sdks/" },
           ],
         },
@@ -86,10 +118,13 @@ export default defineConfig({
         },
       ],
 
+      // Specific guide routes must precede /guides/ for VitePress prefix matching.
+      "/guides/client-pool": sdkSidebar,
       "/guides/": [
         {
           text: "Guides",
           items: [
+            { text: "Overview", link: "/guides/" },
             { text: "Credential Vault", link: "/guides/credential-vault" },
             { text: "Secure Access", link: "/guides/secure-access" },
             { text: "Secure Container", link: "/guides/secure-container" },
@@ -98,45 +133,11 @@ export default defineConfig({
             { text: "Pause & Resume", link: "/guides/pause-resume" },
             { text: "Lifecycle Hooks", link: "/guides/lifecycle-hooks" },
             { text: "Windows Sandbox", link: "/guides/windows-sandbox" },
-            { text: "Client Pool", link: "/guides/client-pool" },
-            { text: "SDK Telemetry", link: "/guides/sdk-telemetry" },
-            { text: "SDK Tracing (Pool Warmup)", link: "/guides/sdk-tracing" },
           ],
         },
       ],
 
-      "/sdks/": [
-        {
-          text: "Sandbox SDKs",
-          collapsed: false,
-          items: [
-            { text: "Overview", link: "/sdks/" },
-            { text: "Python", link: "/sdks/python" },
-            { text: "JavaScript", link: "/sdks/javascript" },
-            { text: "Kotlin", link: "/sdks/kotlin" },
-            { text: "Go", link: "/sdks/go" },
-            { text: "C#", link: "/sdks/csharp" },
-          ],
-        },
-        {
-          text: "Code Interpreter SDKs",
-          collapsed: false,
-          items: [
-            { text: "Python", link: "/sdks/code-interpreter/python" },
-            {
-              text: "JavaScript",
-              link: "/sdks/code-interpreter/javascript",
-            },
-            { text: "Kotlin", link: "/sdks/code-interpreter/kotlin" },
-            { text: "C#", link: "/sdks/code-interpreter/csharp" },
-          ],
-        },
-        {
-          text: "MCP",
-          collapsed: false,
-          items: [{ text: "MCP Server", link: "/sdks/mcp" }],
-        },
-      ],
+      "/sdks/": sdkSidebar,
 
       "/components/": [
         {
@@ -173,12 +174,7 @@ export default defineConfig({
         },
       ],
 
-      "/cli/": [
-        {
-          text: "CLI",
-          items: [{ text: "Reference", link: "/cli/" }],
-        },
-      ],
+      "/cli/": sdkSidebar,
 
       "/examples/": [
         {
@@ -263,6 +259,10 @@ export default defineConfig({
           text: "Releases",
           items: [
             {
+              text: "Versioning",
+              link: "/community/versioning",
+            },
+            {
               text: "Release Automation",
               link: "/community/release-automation",
             },
@@ -285,6 +285,10 @@ export default defineConfig({
             {
               text: "Snapshot Store Migration",
               link: "/reference/snapshot-store-migration",
+            },
+            {
+              text: "Code Interpreter Image Migration",
+              link: "/reference/code-interpreter-image-migration",
             },
           ],
         },

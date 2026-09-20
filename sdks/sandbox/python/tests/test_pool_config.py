@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from datetime import timedelta
 
 import pytest
@@ -67,6 +68,54 @@ def test_default_acquire_min_remaining_ttl_is_60s_for_long_idle_timeout() -> Non
 def test_async_default_acquire_min_remaining_ttl_is_60s_for_long_idle_timeout() -> None:
     config = AsyncPoolConfig(**_async_kwargs())  # type: ignore[arg-type]
     assert config.acquire_min_remaining_ttl == timedelta(seconds=60)
+
+
+@pytest.mark.parametrize(
+    "config_type,kwargs", [(PoolConfig, _sync_kwargs), (AsyncPoolConfig, _async_kwargs)]
+)
+def test_warmup_scheduling_defaults_match_kotlin(
+    config_type: type[PoolConfig] | type[AsyncPoolConfig],
+    kwargs: Callable[[], dict[str, object]],
+) -> None:
+    config = config_type(**kwargs())  # type: ignore[operator,arg-type]
+
+    assert config.warmup_create_qps == 10
+    assert config.warmup_concurrency == 128
+    assert config.warmup_health_check_initial_delay == timedelta(0)
+    assert config.warmup_health_check_polling_interval == timedelta(milliseconds=500)
+    assert config.warmup_post_prepare_health_check is None
+    assert config.warmup_post_prepare_health_check_timeout == timedelta(seconds=30)
+
+
+@pytest.mark.parametrize(
+    "config_type,kwargs", [(PoolConfig, _sync_kwargs), (AsyncPoolConfig, _async_kwargs)]
+)
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("warmup_create_qps", 0, "warmup_create_qps must be positive"),
+        ("warmup_concurrency", 0, "warmup_concurrency must be positive"),
+        (
+            "warmup_health_check_initial_delay",
+            timedelta(milliseconds=-1),
+            "warmup_health_check_initial_delay must be non-negative",
+        ),
+        (
+            "warmup_post_prepare_health_check_timeout",
+            timedelta(0),
+            "warmup_post_prepare_health_check_timeout must be positive",
+        ),
+    ],
+)
+def test_warmup_scheduling_validation_matches_kotlin(
+    config_type: type[PoolConfig] | type[AsyncPoolConfig],
+    kwargs: Callable[[], dict[str, object]],
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        config_type(**kwargs(), **{field: value})  # type: ignore[operator,arg-type]
 
 
 def test_default_acquire_min_remaining_ttl_scales_for_short_idle_timeout() -> None:

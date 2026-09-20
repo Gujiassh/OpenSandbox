@@ -24,6 +24,8 @@ export {
   PoolEmptyException,
   PoolNotRunningException,
   PoolStateStoreUnavailableException,
+  PoolDestroyedException,
+  PoolDestroyIncompleteException,
 } from "./core/exceptions.js";
 
 // Factory pattern (stable public interface; does NOT expose OpenAPI generated models).
@@ -54,6 +56,7 @@ export type {
   CredentialVaultPatchRequest,
   CredentialVaultState,
   CreateSnapshotRequest,
+  CreateSandboxFromTemplateRequest,
   CreateSandboxRequest,
   CreateSandboxResponse,
   CustomHeaderEntry,
@@ -83,6 +86,18 @@ export type {
   SandboxMetadataPatch,
   Volume,
 } from "./models/sandboxes.js";
+export { SandboxOrigin } from "./models/sandboxes.js";
+
+export type {
+  CreateTemplateRequest,
+  ListTemplatesParams,
+  ListTemplatesResponse,
+  TemplateFormat,
+  TemplateInfo,
+  TemplatePhase,
+  TemplateReadiness,
+  TemplateStatus,
+} from "./models/templates.js";
 
 export type { Sandboxes } from "./services/sandboxes.js";
 export type { CredentialVault, Egress } from "./services/egress.js";
@@ -141,21 +156,28 @@ export {
 
 export type {
   SandboxConnectOptions,
+  SandboxCreateFromTemplateOptions,
   SandboxCreateOptions,
 } from "./sandbox.js";
 export { Sandbox } from "./sandbox.js";
 
 export { SandboxPool } from "./pool.js";
+export { SandboxPoolManager } from "./poolManager.js";
+export type { SandboxPoolManagerOptions } from "./poolManager.js";
 export { InMemoryPoolStateStore } from "./poolStore.js";
 export {
   AcquirePolicy,
-  PoolHealthState,
+  PoolDestroyState,
+  PoolDestroyStrategy,
   PoolLifecycleState,
+  PoolState,
   PooledSandboxCreateReason,
 } from "./poolTypes.js";
 export type {
   IdleEntry,
   PoolCreationSpec,
+  PoolDestroyOptions,
+  PoolDestroyResult,
   PoolHealthCheck,
   PoolLogger,
   PoolSandboxPreparer,

@@ -37,6 +37,7 @@ type ExecuteResultHook struct {
 type ExecuteCodeRequest struct {
 	Language Language          `json:"language"`
 	Code     string            `json:"code"`
+	Argv     []string          `json:"argv,omitempty"`
 	Context  string            `json:"context"`
 	Timeout  time.Duration     `json:"timeout"`
 	Cwd      string            `json:"cwd"`
@@ -84,19 +85,14 @@ type CodeContext struct {
 	Language Language `json:"language"`
 }
 
-// bashSessionConfig holds bash session configuration.
 type bashSessionConfig struct {
 	// StartupSource is a list of scripts sourced on startup.
-	StartupSource []string
-	// Session is the session identifier.
-	Session string
-	// StartupTimeout is the startup timeout.
+	StartupSource  []string
+	Session        string
 	StartupTimeout time.Duration
-	// Cwd is the working directory.
-	Cwd string
+	Cwd            string
 }
 
-// bashSession represents a bash session.
 type bashSession struct {
 	config  *bashSessionConfig
 	mu      sync.Mutex

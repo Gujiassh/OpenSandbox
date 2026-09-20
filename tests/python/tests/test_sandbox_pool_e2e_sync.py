@@ -42,6 +42,7 @@ from opensandbox.pool import (
     PoolCreationSpec,
     PoolDestroyOptions,
     PoolDestroyState,
+    PooledSandboxCreator,
     PoolState,
     PoolStateStore,
     SandboxPoolManagerSync,
@@ -58,7 +59,7 @@ from tests.base_e2e_test import (
 MAX_IDLE = 2
 RECONCILE_INTERVAL = timedelta(seconds=1)
 PRIMARY_LOCK_TTL = timedelta(seconds=4)
-DRAIN_TIMEOUT = timedelta(milliseconds=300)
+DRAIN_TIMEOUT = timedelta(seconds=30)
 AWAIT_TIMEOUT = timedelta(minutes=2)
 
 
@@ -110,7 +111,10 @@ class TestSandboxPoolSingleNodeE2ESync:
         self.pool.resize(0)
         released = self.pool.release_all_idle()
         assert released >= 0
-        _eventually("idle drains after resize zero", lambda: self.pool.snapshot().idle_count == 0)
+        _eventually(
+            "idle drains after resize zero",
+            lambda: self.pool.snapshot().idle_count == 0,
+        )
 
         with pytest.raises(PoolEmptyException):
             self.pool.acquire(timedelta(minutes=5), AcquirePolicy.FAIL_FAST)
@@ -121,7 +125,10 @@ class TestSandboxPoolSingleNodeE2ESync:
 
     @pytest.mark.timeout(240)
     def test_destroy_drains_idle_writes_tombstone_and_blocks_acquire(self) -> None:
-        _eventually("pool has warm idle before destroy", lambda: self.pool.snapshot().idle_count >= 1)
+        _eventually(
+            "pool has warm idle before destroy",
+            lambda: self.pool.snapshot().idle_count >= 1,
+        )
 
         manager = SandboxPoolManagerSync(
             state_store=self.store,
@@ -136,7 +143,9 @@ class TestSandboxPoolSingleNodeE2ESync:
         assert result.state == PoolDestroyState.DESTROYED
         assert result.drained_idle_count >= 1
         assert result.persistent_state_cleared
-        assert self.store.get_destroy_state(self.pool_name) == PoolDestroyState.DESTROYED
+        assert (
+            self.store.get_destroy_state(self.pool_name) == PoolDestroyState.DESTROYED
+        )
         with pytest.raises(PoolDestroyedException):
             self.pool.acquire(timedelta(minutes=5), AcquirePolicy.DIRECT_CREATE)
 
@@ -170,7 +179,10 @@ class TestSandboxPoolSingleNodeE2ESync:
     @pytest.mark.timeout(360)
     def test_lifecycle_idempotency_resize_rewarm_and_release_remote(self) -> None:
         self.pool.start()
-        _eventually("pool warms before lifecycle checks", lambda: self.pool.snapshot().idle_count >= 1)
+        _eventually(
+            "pool warms before lifecycle checks",
+            lambda: self.pool.snapshot().idle_count >= 1,
+        )
 
         self.pool.shutdown(False)
         self.pool.shutdown(False)
@@ -186,7 +198,9 @@ class TestSandboxPoolSingleNodeE2ESync:
         assert self.pool.snapshot().idle_count == 0
 
         self.pool.start()
-        _eventually("pool rewarms after restart", lambda: self.pool.snapshot().idle_count >= 1)
+        _eventually(
+            "pool rewarms after restart", lambda: self.pool.snapshot().idle_count >= 1
+        )
 
         self.pool.resize(0)
         assert self.pool.release_all_idle() >= 0
@@ -205,8 +219,13 @@ class TestSandboxPoolSingleNodeE2ESync:
         )
 
     @pytest.mark.timeout(360)
-    def test_concurrent_acquire_resize_and_shutdown_do_not_duplicate_or_deadlock(self) -> None:
-        _eventually("pool reaches target idle", lambda: self.pool.snapshot().idle_count >= MAX_IDLE)
+    def test_concurrent_acquire_resize_and_shutdown_do_not_duplicate_or_deadlock(
+        self,
+    ) -> None:
+        _eventually(
+            "pool reaches target idle",
+            lambda: self.pool.snapshot().idle_count >= MAX_IDLE,
+        )
 
         start = threading.Event()
         acquired_ids: set[str] = set()
@@ -216,7 +235,9 @@ class TestSandboxPoolSingleNodeE2ESync:
         def worker(index: int) -> None:
             try:
                 start.wait()
-                sandbox = self.pool.acquire(timedelta(minutes=5), AcquirePolicy.DIRECT_CREATE)
+                sandbox = self.pool.acquire(
+                    timedelta(minutes=5), AcquirePolicy.DIRECT_CREATE
+                )
                 self.borrowed.append(sandbox)
                 with acquired_lock:
                     assert sandbox.id not in acquired_ids
@@ -240,14 +261,19 @@ class TestSandboxPoolSingleNodeE2ESync:
         # Race acquire and graceful shutdown. POOL_NOT_RUNNING is the expected rejected path.
         self.pool.resize(1)
         self.pool.start()
-        _eventually("pool rewarmed before shutdown race", lambda: self.pool.snapshot().idle_count >= 1)
+        _eventually(
+            "pool rewarmed before shutdown race",
+            lambda: self.pool.snapshot().idle_count >= 1,
+        )
         race_errors: list[BaseException] = []
         start.clear()
 
         def acquire_during_shutdown() -> None:
             try:
                 start.wait()
-                sandbox = self.pool.acquire(timedelta(minutes=5), AcquirePolicy.DIRECT_CREATE)
+                sandbox = self.pool.acquire(
+                    timedelta(minutes=5), AcquirePolicy.DIRECT_CREATE
+                )
                 self.borrowed.append(sandbox)
             except PoolNotRunningException:
                 return
@@ -294,7 +320,10 @@ class TestSandboxPoolSingleNodeE2ESync:
 
         assert not errors
         self.pool.start()
-        _eventually("pool remains usable after lifecycle stress", lambda: self.pool.snapshot().idle_count >= 1)
+        _eventually(
+            "pool remains usable after lifecycle stress",
+            lambda: self.pool.snapshot().idle_count >= 1,
+        )
 
     @pytest.mark.timeout(300)
     def test_warmup_preparer_and_pool_isolation(self) -> None:
@@ -325,21 +354,29 @@ class TestSandboxPoolSingleNodeE2ESync:
         other_manager = SandboxManagerSync.create(create_connection_config_sync())
         try:
             prepared_pool.start()
-            _eventually("prepared pool warms", lambda: prepared_pool.snapshot().idle_count >= 1)
-            sandbox = prepared_pool.acquire(timedelta(minutes=5), AcquirePolicy.FAIL_FAST)
+            _eventually(
+                "prepared pool warms", lambda: prepared_pool.snapshot().idle_count >= 1
+            )
+            sandbox = prepared_pool.acquire(
+                timedelta(minutes=5), AcquirePolicy.FAIL_FAST
+            )
             self.borrowed.append(sandbox)
             result = sandbox.commands.run(f"cat {marker_path}")
             assert result.error is None
             assert result.logs.stdout[0].text == "prepared"
 
             other_pool.start()
-            _eventually("other pool warms", lambda: other_pool.snapshot().idle_count >= 1)
+            _eventually(
+                "other pool warms", lambda: other_pool.snapshot().idle_count >= 1
+            )
             assert _count_tagged_sandboxes(self.manager, self.tag) >= 1
             assert _count_tagged_sandboxes(other_manager, other_tag) >= 1
 
             prepared_pool.resize(0)
             prepared_pool.release_all_idle()
-            _eventually("prepared pool drains", lambda: prepared_pool.snapshot().idle_count == 0)
+            _eventually(
+                "prepared pool drains", lambda: prepared_pool.snapshot().idle_count == 0
+            )
             assert other_pool.snapshot().idle_count >= 1
         finally:
             _cleanup_pool(prepared_pool)
@@ -348,7 +385,254 @@ class TestSandboxPoolSingleNodeE2ESync:
             other_manager.close()
 
     @pytest.mark.timeout(300)
-    def test_warmup_concurrency_above_one_reaches_target_and_stays_bounded(self) -> None:
+    def test_staged_warmup_readiness_prepare_postcheck_order(self) -> None:
+        _cleanup_pool(self.pool)
+        staged_tag = _tag("py-pool-staged")
+        marker_path = f"/tmp/{staged_tag}-prepared.txt"
+        stages: dict[str, list[str]] = {}
+        stage_lock = threading.Lock()
+
+        def record(sandbox: SandboxSync, stage: str) -> None:
+            with stage_lock:
+                stages.setdefault(sandbox.id, []).append(stage)
+
+        def readiness(sandbox: SandboxSync) -> bool:
+            record(sandbox, "readiness")
+            return True
+
+        def preparer(sandbox: SandboxSync) -> None:
+            record(sandbox, "prepare")
+            result = sandbox.commands.run(f"printf prepared > {marker_path}")
+            assert result.error is None
+
+        def post_prepare(sandbox: SandboxSync) -> bool:
+            record(sandbox, "post-prepare")
+            result = sandbox.commands.run(f"cat {marker_path}")
+            return result.error is None and result.logs.stdout[0].text == "prepared"
+
+        staged_pool = _create_pool(
+            pool_name=f"staged-{self.pool_name}",
+            owner_id=f"staged-owner-{self.tag}",
+            state_store=InMemoryPoolStateStore(),
+            tag=staged_tag,
+            max_idle=1,
+            warmup_create_qps=1,
+            warmup_concurrency=1,
+            warmup_health_check_initial_delay=timedelta(milliseconds=100),
+            warmup_health_check=readiness,
+            warmup_sandbox_preparer=preparer,
+            warmup_post_prepare_health_check=post_prepare,
+        )
+        try:
+            staged_pool.start()
+            _eventually(
+                "staged warmup reaches idle",
+                lambda: staged_pool.snapshot().idle_count == 1,
+            )
+            sandbox = staged_pool.acquire(timedelta(minutes=5), AcquirePolicy.FAIL_FAST)
+            self.borrowed.append(sandbox)
+            observed = stages[sandbox.id]
+            assert observed.index("readiness") < observed.index("prepare")
+            assert observed.index("prepare") < observed.index("post-prepare")
+        finally:
+            _cleanup_pool(staged_pool)
+            _cleanup_tagged_sandboxes(self.manager, staged_tag)
+
+    @pytest.mark.timeout(360)
+    def test_warmup_create_qps_admits_across_fixed_one_second_ticks(self) -> None:
+        _cleanup_pool(self.pool)
+        qps_tag = _tag("py-pool-qps")
+        starts: list[float] = []
+        starts_lock = threading.Lock()
+
+        def creator(context):
+            with starts_lock:
+                starts.append(time.monotonic())
+            return SandboxSync.create(
+                get_sandbox_image(),
+                timeout=context.idle_timeout,
+                ready_timeout=context.ready_timeout,
+                entrypoint=["tail", "-f", "/dev/null"],
+                metadata={"tag": qps_tag, "suite": "sandbox-pool-python-e2e"},
+                resource=get_e2e_sandbox_resource(),
+                connection_config=context.connection_config,
+                skip_health_check=True,
+            )
+
+        qps_pool = _create_pool(
+            pool_name=f"qps-{self.pool_name}",
+            owner_id=f"qps-owner-{self.tag}",
+            state_store=InMemoryPoolStateStore(),
+            tag=qps_tag,
+            max_idle=3,
+            warmup_create_qps=1,
+            warmup_concurrency=3,
+            sandbox_creator=creator,
+        )
+        try:
+            qps_pool.start()
+            _eventually(
+                "QPS-limited pool fills",
+                lambda: qps_pool.snapshot().idle_count == 3,
+                timeout=timedelta(seconds=120),
+            )
+            assert len(starts) == 3
+            assert starts[1] - starts[0] >= 0.75
+            assert starts[2] - starts[1] >= 0.75
+        finally:
+            _cleanup_pool(qps_pool)
+            _cleanup_tagged_sandboxes(self.manager, qps_tag)
+
+    @pytest.mark.timeout(360)
+    def test_post_prepare_timeout_deletes_failed_sandbox_and_replenishes(self) -> None:
+        _cleanup_pool(self.pool)
+        timeout_tag = _tag("py-pool-post-timeout")
+        failed_id: str | None = None
+        failed_lock = threading.Lock()
+
+        def post_prepare(sandbox: SandboxSync) -> bool:
+            nonlocal failed_id
+            with failed_lock:
+                if failed_id is None:
+                    failed_id = sandbox.id
+                return sandbox.id != failed_id
+
+        timeout_pool = _create_pool(
+            pool_name=f"post-timeout-{self.pool_name}",
+            owner_id=f"post-timeout-owner-{self.tag}",
+            state_store=InMemoryPoolStateStore(),
+            tag=timeout_tag,
+            max_idle=1,
+            warmup_create_qps=1,
+            warmup_concurrency=1,
+            warmup_post_prepare_health_check=post_prepare,
+            warmup_post_prepare_health_check_timeout=timedelta(seconds=1),
+        )
+        try:
+            timeout_pool.start()
+            _eventually(
+                "post-prepare failure is replaced",
+                lambda: timeout_pool.snapshot().idle_count == 1
+                and _count_tagged_sandboxes(self.manager, timeout_tag) == 1,
+                timeout=timedelta(seconds=120),
+            )
+            assert failed_id is not None
+            entries = timeout_pool.snapshot_idle_entries()
+            assert entries[0].sandbox_id != failed_id
+        finally:
+            _cleanup_pool(timeout_pool)
+            _cleanup_tagged_sandboxes(self.manager, timeout_tag)
+
+    @pytest.mark.timeout(360)
+    def test_readiness_timeout_deletes_failed_sandbox_and_replenishes(self) -> None:
+        _cleanup_pool(self.pool)
+        timeout_tag = _tag("py-pool-ready-timeout")
+        failed_id: str | None = None
+        failed_lock = threading.Lock()
+
+        def readiness(sandbox: SandboxSync) -> bool:
+            nonlocal failed_id
+            with failed_lock:
+                if failed_id is None:
+                    failed_id = sandbox.id
+                return sandbox.id != failed_id
+
+        timeout_pool = _create_pool(
+            pool_name=f"ready-timeout-{self.pool_name}",
+            owner_id=f"ready-timeout-owner-{self.tag}",
+            state_store=InMemoryPoolStateStore(),
+            tag=timeout_tag,
+            max_idle=1,
+            warmup_create_qps=1,
+            warmup_concurrency=1,
+            warmup_health_check=readiness,
+            warmup_ready_timeout=timedelta(seconds=1),
+        )
+        try:
+            timeout_pool.start()
+            _eventually(
+                "readiness failure is replaced",
+                lambda: timeout_pool.snapshot().idle_count == 1
+                and _count_tagged_sandboxes(self.manager, timeout_tag) == 1,
+                timeout=timedelta(seconds=120),
+            )
+            assert failed_id is not None
+            assert timeout_pool.snapshot_idle_entries()[0].sandbox_id != failed_id
+        finally:
+            _cleanup_pool(timeout_pool)
+            _cleanup_tagged_sandboxes(self.manager, timeout_tag)
+
+    @pytest.mark.timeout(360)
+    def test_graceful_shutdown_publishes_admitted_warmup(self) -> None:
+        _cleanup_pool(self.pool)
+        graceful_tag = _tag("py-pool-graceful")
+        entered = threading.Event()
+        release = threading.Event()
+
+        def preparer(sandbox: SandboxSync) -> None:
+            entered.set()
+            assert release.wait(timeout=30)
+
+        graceful_pool = _create_pool(
+            pool_name=f"graceful-{self.pool_name}",
+            owner_id=f"graceful-owner-{self.tag}",
+            state_store=InMemoryPoolStateStore(),
+            tag=graceful_tag,
+            max_idle=1,
+            warmup_sandbox_preparer=preparer,
+            drain_timeout=timedelta(seconds=10),
+        )
+        try:
+            graceful_pool.start()
+            assert entered.wait(timeout=120)
+            releaser = threading.Thread(
+                target=lambda: (time.sleep(0.5), release.set()), daemon=True
+            )
+            releaser.start()
+            started = time.monotonic()
+            graceful_pool.shutdown(True)
+            releaser.join(timeout=5)
+            assert time.monotonic() - started >= 0.4
+            assert graceful_pool.snapshot().idle_count == 1
+        finally:
+            release.set()
+            _cleanup_pool(graceful_pool)
+            _cleanup_tagged_sandboxes(self.manager, graceful_tag)
+
+    @pytest.mark.timeout(360)
+    def test_forced_shutdown_deletes_delayed_uncommitted_warmup(self) -> None:
+        _cleanup_pool(self.pool)
+        forced_tag = _tag("py-pool-forced")
+        forced_pool = _create_pool(
+            pool_name=f"forced-{self.pool_name}",
+            owner_id=f"forced-owner-{self.tag}",
+            state_store=InMemoryPoolStateStore(),
+            tag=forced_tag,
+            max_idle=1,
+            warmup_health_check_initial_delay=timedelta(seconds=30),
+        )
+        try:
+            forced_pool.start()
+            _eventually(
+                "delayed warmup exists before forced shutdown",
+                lambda: _count_tagged_sandboxes(self.manager, forced_tag) == 1,
+                timeout=timedelta(seconds=120),
+            )
+            forced_pool.shutdown(False)
+            assert forced_pool.snapshot().idle_count == 0
+            _eventually(
+                "forced shutdown deletes delayed warmup",
+                lambda: _count_tagged_sandboxes(self.manager, forced_tag) == 0,
+                timeout=timedelta(seconds=60),
+            )
+        finally:
+            _cleanup_pool(forced_pool)
+            _cleanup_tagged_sandboxes(self.manager, forced_tag)
+
+    @pytest.mark.timeout(300)
+    def test_warmup_concurrency_above_one_reaches_target_and_stays_bounded(
+        self,
+    ) -> None:
         _cleanup_pool(self.pool)
         concurrent_tag = _tag("py-pool-warmup-concurrency")
         concurrent_pool = _create_pool(
@@ -419,12 +703,15 @@ class TestSandboxPoolSingleNodeE2ESync:
                 "healthy pool still warms after broken pool path",
                 lambda: healthy_pool.snapshot().idle_count >= 1,
             )
-            sandbox = healthy_pool.acquire(timedelta(minutes=5), AcquirePolicy.FAIL_FAST)
+            sandbox = healthy_pool.acquire(
+                timedelta(minutes=5), AcquirePolicy.FAIL_FAST
+            )
             self.borrowed.append(sandbox)
             assert sandbox.is_healthy()
         finally:
             _cleanup_pool(healthy_pool)
             _cleanup_tagged_sandboxes(self.manager, healthy_tag)
+
 
 @pytest.mark.e2e
 class TestSandboxPoolRedisDistributedE2ESync:
@@ -433,7 +720,9 @@ class TestSandboxPoolRedisDistributedE2ESync:
     def setup_method(self) -> None:
         redis_url = os.getenv("OPENSANDBOX_TEST_REDIS_URL")
         if not redis_url:
-            pytest.skip("Set OPENSANDBOX_TEST_REDIS_URL to run Redis-backed pool E2E tests")
+            pytest.skip(
+                "Set OPENSANDBOX_TEST_REDIS_URL to run Redis-backed pool E2E tests"
+            )
         redis_module = pytest.importorskip("redis")
         self.redis = redis_module.Redis.from_url(redis_url, decode_responses=True)
         self.key_prefix = f"opensandbox:e2e:{uuid.uuid4()}"
@@ -472,7 +761,10 @@ class TestSandboxPoolRedisDistributedE2ESync:
         assert result.error is None
 
         pool_b.resize(0)
-        _eventually("Redis idle drains after shared resize", lambda: pool_a.snapshot().idle_count == 0)
+        _eventually(
+            "Redis idle drains after shared resize",
+            lambda: pool_a.snapshot().idle_count == 0,
+        )
         time.sleep(RECONCILE_INTERVAL.total_seconds() * 2)
         assert pool_a.snapshot().idle_count == 0
         with pytest.raises(PoolEmptyException):
@@ -486,7 +778,9 @@ class TestSandboxPoolRedisDistributedE2ESync:
         assert pool_a.snapshot().idle_count == 0
 
     @pytest.mark.timeout(420)
-    def test_redis_primary_failover_restart_and_resize_jitter_stay_bounded(self) -> None:
+    def test_redis_primary_failover_restart_and_resize_jitter_stay_bounded(
+        self,
+    ) -> None:
         pool_name = f"redis-failover-{self.tag}"
         owner_a = f"owner-a-{self.tag}"
         owner_b = f"owner-b-{self.tag}"
@@ -500,7 +794,8 @@ class TestSandboxPoolRedisDistributedE2ESync:
         pool_a.start()
         _eventually(
             "first Redis node owns primary lock and warms",
-            lambda: self.redis.get(lock_key) == owner_a and pool_a.snapshot().idle_count >= 1,
+            lambda: self.redis.get(lock_key) == owner_a
+            and pool_a.snapshot().idle_count >= 1,
         )
 
         pool_b.start()
@@ -508,7 +803,8 @@ class TestSandboxPoolRedisDistributedE2ESync:
         pool_b.resize(1)
         _eventually(
             "primary lock fails over to remaining Redis node",
-            lambda: self.redis.get(lock_key) == owner_b and pool_b.snapshot().idle_count >= 1,
+            lambda: self.redis.get(lock_key) == owner_b
+            and pool_b.snapshot().idle_count >= 1,
             timeout=timedelta(seconds=60),
         )
 
@@ -525,6 +821,42 @@ class TestSandboxPoolRedisDistributedE2ESync:
         )
 
     @pytest.mark.timeout(420)
+    def test_redis_primary_heartbeat_survives_blocked_warmup(self) -> None:
+        pool_name = f"redis-heartbeat-{self.tag}"
+        owner_id = f"heartbeat-owner-{self.tag}"
+        store = RedisPoolStateStore(self.redis, self.key_prefix)
+        lock_key = store._primary_lock_key(pool_name)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def preparer(sandbox: SandboxSync) -> None:
+            entered.set()
+            release.wait(timeout=10)
+
+        pool = _create_pool(
+            pool_name,
+            owner_id,
+            store,
+            self.tag,
+            1,
+            warmup_sandbox_preparer=preparer,
+            primary_lock_ttl=timedelta(seconds=1),
+        )
+        self.pools.append(pool)
+        pool.start()
+        try:
+            assert entered.wait(timeout=120)
+            time.sleep(2.5)
+            assert self.redis.get(lock_key) == owner_id
+            release.set()
+            _eventually(
+                "blocked warmup commits after heartbeat keeps leadership",
+                lambda: pool.snapshot().idle_count == 1,
+            )
+        finally:
+            release.set()
+
+    @pytest.mark.timeout(420)
     def test_redis_start_overwrites_stale_shared_max_idle_after_restart(self) -> None:
         pool_name = f"redis-restart-config-{self.tag}"
         store_a = RedisPoolStateStore(self.redis, self.key_prefix)
@@ -532,9 +864,14 @@ class TestSandboxPoolRedisDistributedE2ESync:
         self.pools.append(pool_a)
 
         pool_a.start()
-        _eventually("initial Redis pool warms", lambda: pool_a.snapshot().idle_count >= 1)
+        _eventually(
+            "initial Redis pool warms", lambda: pool_a.snapshot().idle_count >= 1
+        )
         pool_a.resize(0)
-        _eventually("initial Redis pool drains to zero", lambda: pool_a.snapshot().idle_count == 0)
+        _eventually(
+            "initial Redis pool drains to zero",
+            lambda: pool_a.snapshot().idle_count == 0,
+        )
         pool_a.shutdown(False)
 
         store_b = RedisPoolStateStore(self.redis, self.key_prefix)
@@ -544,11 +881,14 @@ class TestSandboxPoolRedisDistributedE2ESync:
 
         _eventually(
             "restart with same Redis namespace uses new configured max_idle",
-            lambda: pool_b.snapshot().max_idle == 2 and pool_b.snapshot().idle_count >= 2,
+            lambda: pool_b.snapshot().max_idle == 2
+            and pool_b.snapshot().idle_count >= 2,
         )
 
     @pytest.mark.timeout(420)
-    def test_redis_secondary_resize_is_applied_by_primary_periodic_reconcile(self) -> None:
+    def test_redis_secondary_resize_is_applied_by_primary_periodic_reconcile(
+        self,
+    ) -> None:
         pool_name = f"redis-secondary-resize-{self.tag}"
         owner_a = f"owner-a-{self.tag}"
         owner_b = f"owner-b-{self.tag}"
@@ -562,19 +902,22 @@ class TestSandboxPoolRedisDistributedE2ESync:
         pool_a.start()
         _eventually(
             "primary Redis node owns lock and warms",
-            lambda: self.redis.get(lock_key) == owner_a and pool_a.snapshot().idle_count >= 2,
+            lambda: self.redis.get(lock_key) == owner_a
+            and pool_a.snapshot().idle_count >= 2,
         )
         pool_b.start()
 
         pool_b.resize(0)
         _eventually(
             "secondary resize to zero is applied by primary",
-            lambda: self.redis.get(lock_key) == owner_a and pool_a.snapshot().idle_count == 0,
+            lambda: self.redis.get(lock_key) == owner_a
+            and pool_a.snapshot().idle_count == 0,
         )
         pool_b.resize(2)
         _eventually(
             "secondary resize up is applied by primary",
-            lambda: self.redis.get(lock_key) == owner_a and pool_a.snapshot().idle_count >= 2,
+            lambda: self.redis.get(lock_key) == owner_a
+            and pool_a.snapshot().idle_count >= 2,
         )
 
     @pytest.mark.timeout(360)
@@ -587,13 +930,25 @@ class TestSandboxPoolRedisDistributedE2ESync:
         self.pools.extend([pool_a, pool_b])
         pool_a.start()
         pool_b.start()
-        _eventually("Redis pool warms two idle", lambda: pool_a.snapshot().idle_count >= 2)
+        _eventually(
+            "Redis pool warms two idle", lambda: pool_a.snapshot().idle_count >= 2
+        )
 
         start = threading.Event()
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = [
-                executor.submit(lambda: (start.wait(), pool_a.acquire(timedelta(minutes=5), AcquirePolicy.FAIL_FAST))[1]),
-                executor.submit(lambda: (start.wait(), pool_b.acquire(timedelta(minutes=5), AcquirePolicy.FAIL_FAST))[1]),
+                executor.submit(
+                    lambda: (
+                        start.wait(),
+                        pool_a.acquire(timedelta(minutes=5), AcquirePolicy.FAIL_FAST),
+                    )[1]
+                ),
+                executor.submit(
+                    lambda: (
+                        start.wait(),
+                        pool_b.acquire(timedelta(minutes=5), AcquirePolicy.FAIL_FAST),
+                    )[1]
+                ),
             ]
             start.set()
             sandboxes = [future.result(timeout=90) for future in futures]
@@ -628,7 +983,9 @@ class TestSandboxPoolRedisDistributedE2ESync:
         assert store.snapshot_counters(contention_pool).idle_count == 0
 
     @pytest.mark.timeout(60)
-    def test_redis_expired_idle_is_not_removed_by_snapshot_but_take_reaps_it(self) -> None:
+    def test_redis_expired_idle_is_not_removed_by_snapshot_but_take_reaps_it(
+        self,
+    ) -> None:
         store = RedisPoolStateStore(self.redis, self.key_prefix)
         pool_name = f"redis-expired-idle-{self.tag}"
 
@@ -650,7 +1007,10 @@ class TestSandboxPoolRedisDistributedE2ESync:
         self.pools.extend([pool_a, pool_b])
         pool_a.start()
         pool_b.start()
-        _eventually("Redis jitter pool warms two idle", lambda: pool_a.snapshot().idle_count >= 2)
+        _eventually(
+            "Redis jitter pool warms two idle",
+            lambda: pool_a.snapshot().idle_count >= 2,
+        )
 
         acquired_ids: set[str] = set()
         acquired_lock = threading.Lock()
@@ -752,7 +1112,9 @@ class TestSandboxPoolRedisDistributedE2ESync:
 
         pool_a.start()
         pool_b.start()
-        _eventually("Redis destroy pool warms", lambda: pool_a.snapshot().idle_count >= 1)
+        _eventually(
+            "Redis destroy pool warms", lambda: pool_a.snapshot().idle_count >= 1
+        )
 
         pool_manager = SandboxPoolManagerSync(
             state_store=store_b,
@@ -812,13 +1174,20 @@ def _create_pool(
     warmup_ready_timeout: timedelta = timedelta(seconds=30),
     acquire_ready_timeout: timedelta = timedelta(seconds=30),
     primary_lock_ttl: timedelta = PRIMARY_LOCK_TTL,
-    reconcile_interval: timedelta = RECONCILE_INTERVAL,
+    warmup_create_qps: int = 10,
     warmup_concurrency: int = 1,
+    warmup_health_check_initial_delay: timedelta = timedelta(0),
+    warmup_health_check: Callable[[SandboxSync], bool] | None = None,
+    warmup_post_prepare_health_check: Callable[[SandboxSync], bool] | None = None,
+    warmup_post_prepare_health_check_timeout: timedelta = timedelta(seconds=30),
+    sandbox_creator: PooledSandboxCreator | None = None,
+    drain_timeout: timedelta = DRAIN_TIMEOUT,
 ) -> SandboxPoolSync:
     return SandboxPoolSync(
         pool_name=pool_name,
         owner_id=owner_id,
         max_idle=max_idle,
+        warmup_create_qps=warmup_create_qps,
         warmup_concurrency=warmup_concurrency,
         state_store=state_store,
         connection_config=connection_config or create_connection_config_sync(),
@@ -833,10 +1202,14 @@ def _create_pool(
             },
             resource=get_e2e_sandbox_resource(),
         ),
-        reconcile_interval=reconcile_interval,
         primary_lock_ttl=primary_lock_ttl,
-        drain_timeout=DRAIN_TIMEOUT,
+        drain_timeout=drain_timeout,
         warmup_sandbox_preparer=warmup_sandbox_preparer,
+        warmup_health_check_initial_delay=warmup_health_check_initial_delay,
+        warmup_health_check=warmup_health_check,
+        warmup_post_prepare_health_check=warmup_post_prepare_health_check,
+        warmup_post_prepare_health_check_timeout=warmup_post_prepare_health_check_timeout,
+        sandbox_creator=sandbox_creator,
         degraded_threshold=degraded_threshold,
         warmup_ready_timeout=warmup_ready_timeout,
         acquire_ready_timeout=acquire_ready_timeout,
@@ -920,7 +1293,9 @@ def _cleanup_tagged_sandboxes(manager: SandboxManagerSync, tag: str) -> None:
 
 
 def _count_tagged_sandboxes(manager: SandboxManagerSync, tag: str) -> int:
-    infos = manager.list_sandbox_infos(SandboxFilter(metadata={"tag": tag}, page_size=50))
+    infos = manager.list_sandbox_infos(
+        SandboxFilter(metadata={"tag": tag}, page_size=50)
+    )
     return len(infos.sandbox_infos)
 
 

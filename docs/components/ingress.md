@@ -10,8 +10,8 @@ description: HTTP/WebSocket reverse proxy that routes traffic to OpenSandbox ins
 - Resolves legacy sandbox routes using the Kubernetes provider selected by `--provider-type`:
   - BatchSandbox: reads endpoints from `sandbox.opensandbox.io/endpoints` annotation.
   - AgentSandbox: reads `status.serviceFQDN`.
-- Can serve fleets routes from the same ingress when `--fastpath-endpoint` is set.
-- Fleets routes lazily call FastPath v2 `ResolveEndpoint` when traffic arrives.
+- Can serve Fast Sandbox routes from the same ingress when `--fastpath-endpoint` is set.
+- Fast Sandbox routes lazily call FastPath v2 `ResolveEndpoint` when traffic arrives.
 - Exposes `/status.ok` health check and a shadow-only network readiness assessment at `/status.ok/network-readiness`; prints build metadata (version, commit, time, Go/platform) at startup.
 
 ## Quick Start
@@ -20,12 +20,132 @@ cd components/ingress
 
 go run main.go \
   --namespace <any-value-kept-for-compatibility> \
-  --provider-type <batchsandbox|agent-sandbox|fleets> \
+  --provider-type <batchsandbox|agent-sandbox|fast-sandbox> \
   --mode <header|uri> \
   --port 28888 \
   --log-level info
 ```
 Endpoints: `/` (proxy), `/status.ok` (health), `/status.ok/network-readiness` (shadow network assessment).
+
+## L7 Frontend Configuration for WebSocket
+
+The ingress listens for cleartext HTTP/1.1 and does not terminate TLS. A TLS-terminating L7 proxy must therefore send a classic RFC 6455 HTTP/1.1 handshake to the ingress:
+
+```http
+GET /path HTTP/1.1
+Connection: Upgrade
+Upgrade: websocket
+```
+
+The ingress does **not** accept RFC 8441 WebSocket over HTTP/2 (`CONNECT` with `:protocol = websocket`). Its WebSocket handler accepts only `GET` requests, and the underlying [coder/websocket](https://github.com/coder/websocket) library does not currently support this server-side HTTP/2 handshake. Upstream HTTP/2 support is tracked in [coder/websocket#4](https://github.com/coder/websocket/issues/4).
+
+This distinction matters when the browser-facing L7 endpoint advertises `h2` with ALPN. RFC 7540 forbids the HTTP/1.1 `Connection` and `Upgrade` headers on a normal HTTP/2 request. The L7 must consequently ensure that the ingress-facing WebSocket request is HTTP/1.1. Depending on the L7 implementation, it can do that by making the WebSocket client use HTTP/1.1 or by translating RFC 8441 to RFC 6455.
+
+| Strategy | Browser-to-L7 connection | L7-to-ingress connection | Status |
+| --- | --- | --- | --- |
+| Force HTTP/1.1 with ALPN | HTTP/1.1 | HTTP/1.1 | Verified fallback |
+| Per-WebSocket HTTP/1.1 fallback | HTTP/1.1 for WebSocket; h2 can remain available for other requests | HTTP/1.1 | L7-specific; verify before deployment |
+| RFC 8441-to-RFC 6455 translation | HTTP/2 Extended CONNECT | HTTP/1.1 Upgrade | L7-specific; not verified by this project |
+| Forward HTTP/2 to the ingress | HTTP/2 | HTTP/2 | Not supported |
+
+::: warning
+Do not assume that enabling HTTP/2 on the frontend and `proto h1` on the backend is sufficient. Confirm the L7's documented WebSocket behavior and test it with a real browser. OpenSandbox does not currently publish a verified nginx-ingress or HAProxy translation configuration.
+:::
+
+### Verified fallback: force HTTP/1.1
+
+The portable fallback is to remove `h2` from the L7 proxy's browser-facing ALPN list. The browser and ingress-facing hop then use the classic RFC 6455 handshake.
+
+HAProxy example:
+
+```haproxy
+frontend main
+    bind :443 ssl crt /etc/haproxy/certs/ alpn http/1.1
+    # ↑ Remove "h2," from the alpn list to force HTTP/1.1
+```
+
+For `haproxytech/kubernetes-ingress`, set the following in the controller
+ConfigMap:
+
+```yaml
+data:
+  tls-alpn: "http/1.1"
+```
+
+Trade-off: browsers lose HTTP/2 multiplexing and header compression on the
+browser leg, but the configuration is minimal and there is no version
+dependency on the L7 proxy.
+
+### L7-specific alternatives
+
+Some L7 proxies can keep HTTP/2 enabled for ordinary browser traffic while making WebSocket connections use HTTP/1.1. For example, HAProxy's [`h2-workaround-bogus-websocket-clients`](https://docs.haproxy.org/3.2/configuration.html#3.1-h2-workaround-bogus-websocket-clients) disables its RFC 8441 advertisement so affected clients open WebSockets over HTTP/1.1. This is a client-side fallback, not HTTP/2-to-HTTP/1.1 translation.
+
+An L7 proxy may instead accept RFC 8441 Extended CONNECT and translate it to an RFC 6455 HTTP/1.1 Upgrade request. Support and configuration are product- and version-specific. Treat this topology as unverified until a real-browser test confirms all of the following:
+
+- The page negotiates HTTP/2 with the L7.
+- The WebSocket opens and exchanges data.
+- The ingress receives an HTTP/1.1 `GET` with valid `Connection: Upgrade` and `Upgrade: websocket` headers.
+- Subprotocols, cookies, close codes, and messages larger than 32 KiB survive the complete path.
+
+### HTTP/2 on the ingress-facing hop is not supported
+
+Some HAProxy configurations forward RFC 8441 h2 Extended CONNECT to the
+backend unchanged (`server ingress-svc <addr> proto h2`). The ingress does
+not accept this shape: the CONNECT request never enters the WebSocket
+handler, and the plain HTTP proxy path cannot complete a WebSocket
+handshake either. Configure the ingress-facing hop as HTTP/1.1.
+
+### Diagnostics
+
+If a browser or SDK reports `WebSocket close 1006`, first force HTTP/1.1 through the public L7 endpoint. This verifies the complete HTTP/1.1 route, but it does not isolate the L7 from the ingress.
+
+```bash
+curl --http1.1 -sv --max-time 5 \
+    -H 'Connection: Upgrade' \
+    -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' \
+    -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+    "https://${sandbox_id}-${port}.example.com/some/ws/path" 2>&1 | \
+    grep -E '^< HTTP|^< Sec-WebSocket-Accept'
+
+# Expected output:
+# < HTTP/1.1 101 Switching Protocols
+# < Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+```
+
+`curl` can exit with timeout status after printing `101` because the upgraded connection remains open; the handshake is nevertheless successful. A `200` response with an HTML body means some hop did not process the request as a WebSocket upgrade.
+
+Do **not** try to emulate an HTTP/2 WebSocket with `curl --http2 -H 'Upgrade: websocket'`. RFC 7540 forbids those connection-specific headers on HTTP/2, while RFC 8441 uses Extended CONNECT and a successful 2xx response rather than `101`.
+
+To confirm which protocol the L7 negotiated with the client (independent of
+the WebSocket outcome), inspect only the ALPN line:
+
+```bash
+curl -k --http2 -sv --max-time 2 \
+    "https://${sandbox_id}-${port}.example.com/" 2>&1 | \
+    grep -E '^\* ALPN'
+```
+
+- `ALPN, server accepted: http/1.1` — the verified fallback is active.
+- `ALPN, server accepted: h2` — this result alone says nothing about WebSocket behavior. Verify the WebSocket with a real browser and inspect the ingress-facing request.
+
+### Related to WebSocket forwarding behavior
+
+- The ingress recognizes case-insensitive `Connection` header tokens and
+  accepts `Connection: keep-alive, Upgrade` in addition to
+  `Connection: Upgrade`.
+- Backend redirect (3xx) and error (4xx/5xx) responses during the
+  handshake are surfaced to the caller verbatim; the ingress does not
+  follow redirects, so a stale `Location: /login` never leaks
+  Authorization headers to an unrelated endpoint.
+- Client-selected WebSocket subprotocols and backend `Set-Cookie` headers
+  are forwarded across the handshake.
+- Application close codes (for example, `1008 policy violation`,
+  `4001+ application codes`) are propagated to the peer without being
+  rewritten to `1000`.
+- A single WebSocket message is limited to 64 MiB in either direction. This
+  accommodates terminal and Jupyter traffic above `coder/websocket`'s 32 KiB
+  default without retaining the previous unbounded allocation risk.
 
 ## Network Readiness Observation
 
@@ -58,6 +178,9 @@ Invalid shadow settings disable connection observation and make the shadow
 endpoint return HTTP 404; they do not stop the Ingress data plane.
 
 The following OpenTelemetry metrics are emitted when OTLP metrics are enabled:
+
+See [component telemetry configuration](/guides/component-telemetry) for endpoint
+selection, standard disable switches, and cumulative/delta export settings.
 
 - `ingress.upstream.connect.count` and `ingress.upstream.connect.duration`,
   labeled only by connection result and proxy type.
@@ -145,13 +268,18 @@ The server must have `renew_intent` (and Redis consumer for ingress mode) enable
 | `--renew-intent-queue-max-len` | `0` | Max list length (0 = no cap); LTRIM applied when > 0 |
 | `--renew-intent-min-interval` | `60` | Min seconds between intents per sandbox (client-side throttle) |
 
-Fleets intents additionally carry the authenticated namespace. Their publisher
+Fast Sandbox intents additionally carry the authenticated namespace. Their publisher
 throttle key is `(namespace, sandbox_id)` so equal IDs in different tenant
 namespaces remain independent.
 
-## Fleets Provider
+## Fast Sandbox Provider {#fast-sandbox-provider}
 
-The Phase 1a fleets provider accepts only an authenticated internal fleets
+The implementation is named `FastSandboxProvider`; its CLI provider value is
+`fast-sandbox`. Server-created Fast Sandbox IDs use the `fsb-` prefix. Ingress verifies
+route scopes with the same `opensandbox-fsb-route-v1` signing tag as the Server.
+The `f1.` token prefix identifies the route-scope format version.
+
+The Phase 1a Fast Sandbox provider accepts only an authenticated internal Fast Sandbox
 route scope. It resolves execd port `44772` and other user ports as raw
 ports. Execd must already be installed and started by the workload image/template;
 it is not delivered as a runtime Infra Component. Pools using the old named
@@ -161,26 +289,26 @@ Endpoint handles can be issued while a sandbox is pending; actual
 traffic receives `503` with `Retry-After` until FastPath publishes the route.
 Port `18080` handles are reserved for SDK compatibility and traffic returns
 `501`; use the authenticated Server `GET/PUT /sandboxes/{id}/networkpolicy`
-route instead. See [Server policy operations](/components/server#fleets-workload-and-network-policy).
+route instead. See [Server policy operations](/components/server#fast-sandbox-workload-and-network-policy).
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--provider-type` | `batchsandbox` | Select the legacy Kubernetes provider, or set to `fleets` for fleets-only routing |
-| `--fastpath-endpoint` | empty | FastPath v2 gRPC endpoint; a non-empty value enables fleets routing |
+| `--provider-type` | `batchsandbox` | Select the legacy Kubernetes provider, or set to `fast-sandbox` for Fast Sandbox-only routing |
+| `--fastpath-endpoint` | empty | FastPath v2 gRPC endpoint; a non-empty value enables Fast Sandbox routing |
 | `--fastpath-access-mode` | `direct-fastlet-proxy` | Use `central-proxy` when ingress cannot reach Fastlet Pod IPs |
 | `--fastpath-wait-timeout-millis` | `2000` | Deadline for one FastPath ResolveEndpoint RPC |
-| `--secure-access-keys` | empty | Shared signing key ring; required for fleets route-scope verification |
+| `--secure-access-keys` | empty | Shared signing key ring; required for Fast Sandbox route-scope verification |
 
 With `--provider-type=batchsandbox` and a non-empty `--fastpath-endpoint`, one ingress serves both
-legacy BatchSandbox routes and authenticated fleets routes. The same applies to
+legacy BatchSandbox routes and authenticated Fast Sandbox routes. The same applies to
 `agent-sandbox`. The verified route format selects the backend explicitly:
 legacy host/URI routes use the Kubernetes provider, while `f1.*` route scopes
 use FastPath. Invalid `f1.*` scopes are rejected and never fall back to the
-legacy provider. `--provider-type=fleets` remains available for deployments
+legacy provider. `--provider-type=fast-sandbox` remains available for deployments
 that do not need Kubernetes-backed routes. BatchSandbox and AgentSandbox remain
 alternative Kubernetes providers; enabling FastPath does not enable both.
 
-For a shared BatchSandbox and fleets ingress:
+For a shared BatchSandbox and Fast Sandbox ingress:
 
 ```bash
 go run main.go \
@@ -189,7 +317,7 @@ go run main.go \
   --secure-access-keys 'a=<base64-secret>'
 ```
 
-`--provider-type=fleets` also requires an explicit `--fastpath-endpoint`; the
+`--provider-type=fast-sandbox` also requires an explicit `--fastpath-endpoint`; the
 ingress fails startup when the endpoint cannot establish a gRPC connection
 within five seconds. FastPath gRPC uses plaintext transport in Phase 1a and
 must be isolated with NetworkPolicy. TLS or mTLS requires matching support in
@@ -203,33 +331,33 @@ NetworkPolicy can select an ingress Pod labeled
 `sandbox.fast.io/scope=system`. The FastPath policy must admit that trusted
 namespace when the two systems are deployed in different namespaces.
 
-Fleets supports Header and URI route scopes in Phase 1a. Wildcard-host scopes
+Fast Sandbox supports Header and URI route scopes in Phase 1a. Wildcard-host scopes
 are not supported because the authenticated namespace, sandbox ID, and MAC do
 not fit safely in one DNS label.
 
-### Server-issued Fleets endpoints
+### Server-issued Fast Sandbox endpoints {#server-issued-fast-sandbox-endpoints}
 
-The Fleets Server adapter returns a stable route from
+The Fast Sandbox Server adapter returns a stable route from
 `GET /sandboxes/{sandboxId}/endpoints/{port}` without calling FastPath or waiting
 for readiness. It signs the authenticated tenant namespace, sandbox ID, and port
 using the existing ingress signing configuration. Without multi-tenancy, it uses
-the configured Fleets namespace.
+the configured Fast Sandbox namespace.
 
-With `runtime.type = "kubernetes"`, the Server also serves existing `flt-` sandbox
-IDs through Fleets; no additional enable flag or runtime list is needed. Ordinary
-IDs and create requests retain their Kubernetes behavior. The existing `fleets`
-runtime remains available for Fleets-only deployments. This does not implement
-template management or a template-based create selector.
+With `runtime.type = "kubernetes"`, the Server uses `CompositeSandboxService`
+to serve Kubernetes and Fast Sandbox workloads together. Create requests with
+`templateId` select `FastSandboxService`; other creates use the Kubernetes
+workload provider. Subsequent operations on `fsb-` sandbox IDs use Fast Sandbox.
+FastPath settings live under `[kubernetes]`; `fast-sandbox` is an Ingress provider
+value, not a separate Server runtime type.
 
-Fleets Get/List reads the existing `sandbox.fast.io/v1alpha2` Sandbox CRs through
+Fast Sandbox Get/List reads the existing `sandbox.fast.io/v1alpha2` Sandbox CRs through
 the Kubernetes LIST/WATCH cache. Writes still go through FastPath and invalidate
 the corresponding cache. Unsynced or invalidated reads use the live Kubernetes
 API; Get does not interpret a cache miss as NotFound. Reads require access to the
 same cluster as FastPath and `get`, `list`, `watch` permissions on `sandboxes` in
 each tenant namespace. Kubernetes deployments reuse their configured cluster
-client and default namespace; an explicit `[fleets].namespace` overrides the
-default when tenancy is disabled. Fleets-only deployments load Kubernetes
-credentials lazily on the first CR read. No separate sandbox database is created.
+client and `[kubernetes].namespace` when tenancy is disabled. No separate
+sandbox database is created.
 
 The shared sandbox list combines both backends for the current tenant, then
 filters, orders by creation time descending (ID breaks ties), and paginates once.
@@ -263,7 +391,7 @@ key = "<base64-encoded-secret>"
 Header mode returns the gateway address and an `OpenSandbox-Ingress-To: f1.*`
 header. URI mode returns `<gateway-address>/f1.*`. Clients must preserve the
 returned route and headers. These scopes have no embedded expiration, so the
-Fleets adapter rejects the optional `expires` parameter rather than silently
+Fast Sandbox adapter rejects the optional `expires` parameter rather than silently
 issuing a non-expiring route. Missing signing keys, direct mode, and wildcard
 mode are also rejected. Endpoint discovery does not establish sandbox existence;
 Ingress performs the tenant-scoped lookup when traffic arrives.
@@ -281,8 +409,8 @@ protobuf. `ResolveEndpoint` no longer accepts `wait_until_ready` or
 shared wire fixture in `components/ingress/pkg/fastpath/v2/testdata` is exercised
 by both Python and Go tests.
 
-The `f1.` prefix is reserved for fleets route scopes. A legacy route whose first
-host or URI segment starts with `f1.` is treated as a fleets route and returns
+The `f1.` prefix is reserved for Fast Sandbox route scopes. A legacy route whose first
+host or URI segment starts with `f1.` is treated as a Fast Sandbox route and returns
 `401` when verification fails; it never falls back to a legacy provider.
 
 **Example (with Redis):**
@@ -322,7 +450,7 @@ TAG=local VERSION=1.2.3 GIT_COMMIT=abc BUILD_TIME=2025-01-01T00:00:00Z bash buil
 ## Runtime Requirements
 - Access to Kubernetes API (in-cluster or via KUBECONFIG).
 - If `--provider-type=batchsandbox`: BatchSandbox CRs in any namespace with `sandbox.opensandbox.io/endpoints` annotation containing Pod IPs.
-- If `--provider-type=agent-sandbox`: AgentSandbox CRs in any namespace with `status.serviceFQDN` populated.
+- If `--provider-type=agent-sandbox`: agent-sandbox >= v0.5.0 serving `agents.x-k8s.io/v1beta1`, with `Ready=True` and `status.serviceFQDN` populated. Set `spec.service: true` for service creation (the OpenSandbox server sets this automatically). See [compatibility and migration](/examples/agent-sandbox#compatibility-and-migration).
 - If `--fastpath-endpoint` is set: network access to FastPath v2 and a matching
   `--secure-access-keys` key ring shared with the OpenSandbox server.
 

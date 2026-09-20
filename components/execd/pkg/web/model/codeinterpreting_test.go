@@ -128,15 +128,12 @@ func unsetModelEnvForTest(t *testing.T, key string) {
 func ptr32(v uint32) *uint32 { return &v }
 
 func TestRunCommandRequestValidateUidGid(t *testing.T) {
-	// uid-only: valid
 	req := RunCommandRequest{Command: "id", Uid: ptr32(1000)}
 	require.NoError(t, req.Validate(), "expected success with uid only")
 
-	// uid + gid: valid
 	req = RunCommandRequest{Command: "id", Uid: ptr32(1000), Gid: ptr32(1000)}
 	require.NoError(t, req.Validate(), "expected success with uid and gid")
 
-	// gid-only: must be rejected
 	req = RunCommandRequest{Command: "id", Gid: ptr32(1000)}
 	require.Error(t, req.Validate(), "expected validation error when gid is set without uid")
 }
@@ -195,4 +192,39 @@ func TestServerStreamEventSummary(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRunCommandArgvValidation(t *testing.T) {
+	for _, body := range []string{`{}`, `{"command":"echo", "argv":["tool"]}`, `{"command":"", "argv":["tool"]}`, `{"argv":[]}`, `{"argv":null}`, `{"argv":[""]}`, `{"argv":["tool",null]}`, `{"argv":["tool","\u0000"]}`} {
+		var req RunCommandRequest
+		err := json.Unmarshal([]byte(body), &req)
+		if err == nil {
+			err = req.Validate()
+		}
+		require.Error(t, err, body)
+	}
+	var req RunCommandRequest
+	require.NoError(t, json.Unmarshal([]byte(`{"argv":["tool","","$HOME"]}`), &req))
+	require.NoError(t, req.Validate())
+}
+
+func TestCommandAndSessionCwdUseTheirOwnEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing")
+	t.Setenv("ARGV_DIR", missing)
+	envFile := filepath.Join(t.TempDir(), "envs")
+	require.NoError(t, os.WriteFile(envFile, []byte("ARGV_DIR="+dir+"\n"), 0600))
+	t.Setenv("EXECD_ENVS", envFile)
+	for _, req := range []RunCommandRequest{{Command: "pwd"}, {Argv: []string{"tool"}}} {
+		req.Cwd = "$ARGV_DIR"
+		require.NoError(t, req.Validate())
+		req.Envs = map[string]string{"ARGV_DIR": missing}
+		require.Error(t, req.Validate())
+	}
+	// Session cwd validation is deferred to the runtime layer, which resolves
+	// against the target session's environment (EXECD_ENVS file values and
+	// variables exported in earlier runs), not the daemon environment. See
+	// Controller.ValidateBashSessionCwd.
+	session := RunInSessionRequest{Command: "pwd", Cwd: "$ARGV_DIR"}
+	require.NoError(t, session.Validate())
 }

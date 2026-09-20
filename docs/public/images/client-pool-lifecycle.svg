@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1400" height="720" viewBox="0 0 1400 720" role="img" aria-labelledby="title desc">
   <title id="title">Client Pool Lifecycle State Machine</title>
-  <desc id="desc">State machine of the client pool. Lifecycle states NOT_STARTED, STARTING, RUNNING, DRAINING and STOPPED, with an inner health substate machine on RUNNING that toggles between HEALTHY and DEGRADED based on consecutive create failures.</desc>
+  <desc id="desc">State machine of the client pool. Lifecycle states NOT_STARTED, STARTING, RUNNING, DRAINING and STOPPED, with an inner health substate machine on RUNNING that toggles between HEALTHY and DEGRADED based on consecutive warmup or reconcile failures.</desc>
   <defs>
     <marker id="a4-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#1e3a5f"/>
@@ -60,7 +60,7 @@
   <!-- DEGRADED -->
   <rect x="860" y="380" width="160" height="80" rx="12" fill="#fef3c7" stroke="#92400e" stroke-width="2"/>
   <text x="940" y="413" class="state-name" text-anchor="middle" fill="#92400e">DEGRADED</text>
-  <text x="940" y="436" class="state-hint" text-anchor="middle">backoff: Python / Go only</text>
+  <text x="940" y="436" class="state-hint" text-anchor="middle">backoff only in Go</text>
 
   <!-- HEALTHY -> DEGRADED -->
   <path d="M 830 300 Q 900 340 890 378" stroke="#b91c1c" stroke-width="2" fill="none" marker-end="url(#a4-arrow-red)"/>

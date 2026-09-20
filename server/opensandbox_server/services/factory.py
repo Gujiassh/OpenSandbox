@@ -24,8 +24,8 @@ from typing import Optional
 
 from opensandbox_server.config import AppConfig, get_config
 from opensandbox_server.services.docker import DockerSandboxService
-from opensandbox_server.services.fleets import FleetSandboxService
 from opensandbox_server.services.k8s import KubernetesSandboxService
+from opensandbox_server.services.fast_sandbox import FastSandboxService
 from opensandbox_server.services.sandbox_service import SandboxService
 from opensandbox_server.services.composite_service import CompositeSandboxService
 
@@ -52,14 +52,13 @@ def create_sandbox_service(
     active_config = config or get_config()
     selected_type = (service_type or active_config.runtime.type).lower()
 
-    logger.info("Creating sandbox service with type: %s", selected_type)
+    logger.info(f"Creating sandbox service with type: {selected_type}")
 
     # Service implementation registry
     # Add new implementations here as they are created
     implementations = {
         "docker": DockerSandboxService,
         "kubernetes": KubernetesSandboxService,
-        "fleets": FleetSandboxService,
     }
 
     if selected_type not in implementations:
@@ -73,6 +72,6 @@ def create_sandbox_service(
         implementation = KubernetesSandboxService(config=active_config)
         return CompositeSandboxService(
             implementation,
-            FleetSandboxService(active_config, k8s_client=implementation.k8s_client),
+            FastSandboxService(active_config, k8s_client=implementation.k8s_client),
         )
     return implementations[selected_type](config=active_config)
