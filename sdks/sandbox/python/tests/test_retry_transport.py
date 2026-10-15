@@ -87,6 +87,88 @@ def _raise(exc: BaseException) -> Callable[[], httpx.Response]:
     return _factory
 
 
+class _PartialUploadSyncTransport(httpx.BaseTransport):
+    def __init__(self, error: httpx.TransportError) -> None:
+        self.error = error
+        self.calls = 0
+        self.chunks: list[bytes] = []
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        self.calls += 1
+        self.chunks.append(next(iter(request.stream)))
+        if self.calls == 1:
+            raise self.error
+        return httpx.Response(200)
+
+
+class _PartialUploadAsyncTransport(httpx.AsyncBaseTransport):
+    def __init__(self, error: httpx.TransportError) -> None:
+        self.error = error
+        self.calls = 0
+        self.chunks: list[bytes] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.calls += 1
+        self.chunks.append(await anext(request.stream.__aiter__()))
+        if self.calls == 1:
+            raise self.error
+        return httpx.Response(200)
+
+
+@pytest.mark.parametrize("error_type", [httpx.WriteError, httpx.ReadTimeout, httpx.RemoteProtocolError])
+def test_sync_partial_upload_keeps_original_transport_error(error_type: type[httpx.TransportError]) -> None:
+    error = error_type("upload interrupted")
+    inner = _PartialUploadSyncTransport(error)
+
+    def chunks():
+        yield b"first"
+        yield b"second"
+
+    with httpx.Client(transport=RetrySyncTransport(inner, _fast_policy())) as client:
+        with pytest.raises(error_type) as caught:
+            client.put("http://upload.test/", content=chunks())
+    assert caught.value is error
+    assert inner.calls == 1
+    assert inner.chunks == [b"first"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [httpx.WriteError, httpx.ReadTimeout, httpx.RemoteProtocolError])
+async def test_async_partial_upload_keeps_original_transport_error(error_type: type[httpx.TransportError]) -> None:
+    error = error_type("upload interrupted")
+    inner = _PartialUploadAsyncTransport(error)
+
+    async def chunks():
+        yield b"first"
+        yield b"second"
+
+    async with httpx.AsyncClient(transport=RetryAsyncTransport(inner, _fast_policy())) as client:
+        with pytest.raises(error_type) as caught:
+            await client.put("http://upload.test/", content=chunks())
+    assert caught.value is error
+    assert inner.calls == 1
+    assert inner.chunks == [b"first"]
+
+
+def test_sync_replayable_upload_retries_after_transport_error() -> None:
+    inner = _PartialUploadSyncTransport(httpx.WriteError("upload interrupted"))
+    with httpx.Client(transport=RetrySyncTransport(inner, _fast_policy())) as client:
+        response = client.put("http://upload.test/", content=b"payload")
+    assert response.status_code == 200
+    assert inner.calls == 2
+    assert inner.chunks == [b"payload", b"payload"]
+
+
+@pytest.mark.asyncio
+async def test_async_replayable_upload_retries_after_transport_error() -> None:
+    inner = _PartialUploadAsyncTransport(httpx.WriteError("upload interrupted"))
+    async with httpx.AsyncClient(transport=RetryAsyncTransport(inner, _fast_policy())) as client:
+        response = await client.put("http://upload.test/", content=b"payload")
+    assert response.status_code == 200
+    assert inner.calls == 2
+    assert inner.chunks == [b"payload", b"payload"]
+
+
 def _fast_policy(
     *,
     max_retries: int = 3,

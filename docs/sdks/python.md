@@ -654,8 +654,10 @@ Default behavior:
   failures (before any byte is written) are still retried for these methods.
 - Up to `3` retries with decorrelated-jitter exponential backoff, honoring a
   server `Retry-After` header (capped at 60s).
-- **SSE / streaming requests bypass retry** entirely (bodies are not
-  replayable).
+- **SSE requests bypass retry** entirely.
+- Non-replayable upload bodies are not resent after a post-send or opaque
+  transport failure, even for idempotent methods. The original network exception
+  is propagated. Replayable in-memory bodies retain normal retry behavior.
 
 ::: warning Behavior change
 Retries are on by default. This can increase the number of HTTP attempts and

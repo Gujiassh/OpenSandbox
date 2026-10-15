@@ -57,9 +57,9 @@ def should_retry(
 
     Checks budget/deadline/cancellation first, then the transport-vs-status
     branch. Pre-send transport failures retry on any method; post-send
-    and opaque transport failures retry on idempotent methods only.
+    and opaque transport failures require an idempotent method and replayable body.
 
-    ``body_replayable`` guards non-idempotent uploads: when the request
+    ``body_replayable`` guards streamed uploads: when the request
     body cannot be re-sent (async/sync generators, file-like streams,
     multipart ``files=`` bodies), re-dispatching the same
     ``httpx.Request`` would raise ``StreamConsumed`` or send a truncated
@@ -89,7 +89,7 @@ def should_retry(
             if not body_replayable and retries_used >= 1:
                 return False
             return True
-        return idempotent
+        return idempotent and body_replayable
 
     if outcome.status_code is None:
         return False

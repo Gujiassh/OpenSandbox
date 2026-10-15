@@ -160,6 +160,17 @@ class TestDecisionTransportBranch:
 
 
 class TestDecisionNonReplayableBody:
+    @pytest.mark.parametrize("opaque", [False, True])
+    def test_post_send_requires_replayable_body(self, opaque: bool) -> None:
+        outcome = Outcome(is_transport_error=True, is_opaque_transport=opaque)
+        policy = RetryPolicy()
+        assert not should_retry(
+            "PUT", outcome, 0, policy, timedelta(0), body_replayable=False
+        )
+        assert should_retry(
+            "PUT", outcome, 0, policy, timedelta(0), body_replayable=True
+        )
+
     def test_status_retry_suppressed_for_non_replayable_body(self) -> None:
         # POST opted into 503 status retry, but a non-replayable body
         # must never be resent.
